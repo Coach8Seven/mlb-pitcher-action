@@ -1,0 +1,68 @@
+openapi: 3.1.0
+info:
+  title: MLB Pitcher Strikeout Helper
+  description: Returns recent MLB pitcher starts with strikeouts and pitch counts for pitcher strikeout prop research.
+  version: 1.0.0
+servers:
+  - url: https://YOUR-DEPLOYED-DOMAIN.example.com
+paths:
+  /pitcher-last-starts:
+    get:
+      operationId: getPitcherLastStarts
+      summary: Get a pitcher's recent starts with strikeouts and pitch counts.
+      description: Use this action when the GPT needs reliable last 5 and last 10 pitcher strikeout logs, pitch counts, innings, opponent, and hit rate versus a strikeout line.
+      parameters:
+        - name: pitcher_name
+          in: query
+          required: true
+          description: Full or common name of the MLB pitcher, such as Paul Skenes.
+          schema:
+            type: string
+        - name: season
+          in: query
+          required: false
+          description: MLB season year. Use the current MLB season unless the user asks otherwise.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Number of recent starts to return. Use 10 by default.
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 15
+        - name: line
+          in: query
+          required: false
+          description: Strikeout prop line, such as 5.5. Used to calculate last 5 and last 10 hit rate for an Over.
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Recent pitcher starts and summary statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pitcher:
+                    type: object
+                  season:
+                    type: string
+                  starts:
+                    type: array
+                    items:
+                      type: object
+                  summary:
+                    type: object
+                  notes:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          description: Missing required pitcher_name.
+        "404":
+          description: Pitcher not found.
+
