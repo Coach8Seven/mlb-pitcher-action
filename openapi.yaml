@@ -1,11 +1,51 @@
 openapi: 3.1.0
 info:
   title: MLB Pitcher Strikeout Helper
-  description: Returns recent MLB pitcher starts with strikeouts, pitch counts, pitch mix, and velocity trend for pitcher strikeout prop research.
-  version: 1.1.0
+  description: Screens MLB games for pitcher-strikeout research and returns detailed recent pitcher starts with pitch mix and velocity trend.
+  version: 1.2.0
 servers:
   - url: https://coach8seven-mlb-pitcher-action.onrender.com
 paths:
+  /game-screening:
+    get:
+      operationId: screenMlbGames
+      summary: Screen screenshot-provided MLB games for deeper pitcher-strikeout research.
+      description: Use this action after the user sends Bet365 game screenshots. Pass only the visible screenshot-provided matchups. This endpoint ranks games for deeper research using probable starters, throwing hand, pitcher K rate, opponent strikeout rate versus handedness, and recent workload. It does not recommend bets.
+      parameters:
+        - name: date
+          in: query
+          required: true
+          description: MLB slate date in YYYY-MM-DD format using the user's intended local slate date.
+          schema:
+            type: string
+        - name: matchups
+          in: query
+          required: true
+          description: Comma-separated screenshot-provided matchups using away@home abbreviations, such as DET@CWS,KC@TEX,SD@WSH. Do not add matchups outside the user's screenshots.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ranked game-screening results for deeper pitcher-K research. Scores are screening aids, not bet recommendations.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  date:
+                    type: string
+                  requestedMatchups:
+                    type: array
+                    items:
+                      type: string
+                  unmatchedRequestedMatchups:
+                    type: array
+                    items:
+                      type: string
+                  games:
+                    type: array
+                    items:
+                      type: object
   /pitcher-last-starts:
     get:
       operationId: getPitcherLastStarts
