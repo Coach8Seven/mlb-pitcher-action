@@ -378,6 +378,70 @@ def _format_screening_game(game, season):
     }
 
 
+def _rank_screening_pitchers(games, limit=10, minimum_score=45):
+    pitchers = []
+    for game in games:
+        for pitcher in game.get("pitchers", []):
+            score = pitcher.get("researchPriorityScore")
+            if not pitcher.get("available") or score is None:
+                continue
+
+            recent = pitcher.get("recentLast5", {})
+            opponent = pitcher.get("opponentHittingSplit", {})
+            season = pitcher.get("season", {})
+            pitchers.append(
+                {
+                    "pitcherId": pitcher.get("id"),
+                    "pitcher": pitcher.get("name"),
+                    "team": pitcher.get("team"),
+                    "opponent": pitcher.get("opponent"),
+                    "matchup": game.get("matchup"),
+                    "gameDate": game.get("gameDate"),
+                    "venue": game.get("venue"),
+                    "throws": pitcher.get("throws"),
+                    "researchPriorityScore": score,
+                    "seasonKRate": season.get("kRate"),
+                    "seasonStrikeoutsPer9": season.get("strikeoutsPer9"),
+                    "opponentSplit": opponent.get("split"),
+                    "opponentKRateVsHand": opponent.get("strikeoutRate"),
+                    "recentLast5AverageKs": recent.get("averageStrikeouts"),
+                    "recentLast5AveragePitches": recent.get("averagePitches"),
+                    "recentLast5AverageBattersFaced": recent.get("averageBattersFaced"),
+                    "recentLast5AverageInningsDecimal": recent.get("averageInningsDecimal"),
+                    "recommendedForDeeperResearch": score >= minimum_score,
+                    "screeningNotes": [
+                        "Use measurable screening data only. Reputation or name value is not a reason to research a pitcher.",
+                        "This is a research shortlist, not a bet recommendation.",
+                        "Bet365 pitcher-K line, price, lineup, news, and weather still require later checks.",
+                    ],
+                }
+            )
+
+    ranked = sorted(
+        pitchers,
+        key=lambda pitcher: pitcher.get("researchPriorityScore") or 0,
+        reverse=True,
+    )
+    recommended = [
+        pitcher
+        for pitcher in ranked
+        if pitcher.get("recommendedForDeeperResearch")
+    ][:limit]
+    not_selected = [
+        pitcher
+        for pitcher in ranked
+        if pitcher.get("pitcherId")
+        not in {item.get("pitcherId") for item in recommended}
+    ]
+
+    for rank, pitcher in enumerate(recommended, start=1):
+        pitcher["researchRank"] = rank
+    for rank, pitcher in enumerate(not_selected, start=len(recommended) + 1):
+        pitcher["screenRank"] = rank
+
+    return recommended, not_selected
+
+
 def _is_whiff(event):
     call = (event.get("details") or {}).get("call") or {}
     code = str(call.get("code") or (event.get("details") or {}).get("code") or "")
@@ -674,6 +738,7 @@ def game_screening():
     )
     for rank, game in enumerate(screened, start=1):
         game["researchRank"] = rank
+    recommended_pitchers, not_selected_pitchers = _rank_screening_pitchers(screened)
 
     return jsonify(
         {
@@ -686,9 +751,14 @@ def game_screening():
             "unmatchedRequestedMatchups": unmatched,
             "gamesReturned": len(screened),
             "games": screened,
+            "recommendedPitchers": recommended_pitchers,
+            "notSelectedPitchers": not_selected_pitchers,
             "notes": [
                 "This endpoint screens games for deeper pitcher-K research. It does not recommend bets.",
                 "Research-priority scores are heuristic sorting aids, not projected win probabilities.",
+                "Recommended pitchers are individual research targets scoring 45 or higher, up to a maximum of 10.",
+                "The shortlist may contain fewer than 10 pitchers when fewer pitchers clear the research threshold.",
+                "Use measurable screening data only. Reputation or name value is not a reason to research a pitcher.",
                 "Send only screenshot-provided matchups in the matchups query when screening a Bet365 screenshot.",
                 "Confirm lineups, injury news, weather, Bet365 pitcher-K lines, and prices before any bet decision.",
             ],
