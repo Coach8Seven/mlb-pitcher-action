@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import requests
@@ -102,6 +103,13 @@ def _pitch_count_from_boxscore(game_pk, person_id):
     return None
 
 
+def _float(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _avg(values, digits=1):
     values = [value for value in values if value is not None]
     if not values:
@@ -113,6 +121,261 @@ def _pct(part, whole):
     if not whole:
         return None
     return round(part / whole, 3)
+
+
+def _innings_to_outs(value):
+    try:
+        whole, _, remainder = str(value or "0").partition(".")
+        return int(whole) * 3 + int(remainder or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _outs_to_innings(outs):
+    return round(outs / 3, 1) if outs is not None else None
+
+
+def _first_stat(data):
+    blocks = data.get("stats", [])
+    if not blocks:
+        return {}
+    splits = blocks[0].get("splits", [])
+    if not splits:
+        return {}
+    return splits[0].get("stat", {})
+
+
+def _pitcher_person(person_id):
+    people = _get_json(f"{MLB_BASE}/people/{person_id}").get("people", [])
+    return people[0] if people else {}
+
+
+def _pitcher_season_stat(person_id, season):
+    data = _get_json(
+        f"{MLB_BASE}/people/{person_id}/stats",
+        {"stats": "season", "group": "pitching", "season": season, "sportIds": 1},
+    )
+    return _first_stat(data)
+
+
+def _team_hitting_split(team_id, pitcher_hand, season):
+    split_code = "vl" if pitcher_hand == "L" else "vr"
+    data = _get_json(
+        f"{MLB_BASE}/teams/{team_id}/stats",
+        {
+            "stats": "statSplits",
+            "group": "hitting",
+            "season": season,
+            "sitCodes": split_code,
+        },
+    )
+    stat = _first_stat(data)
+    plate_appearances = _num(stat.get("plateAppearances"), None)
+    strikeouts = _num(stat.get("strikeOuts"), None)
+    return {
+        "split": "vs Left" if pitcher_hand == "L" else "vs Right",
+        "plateAppearances": plate_appearances,
+        "strikeouts": strikeouts,
+        "strikeoutRate": _pct(strikeouts, plate_appearances),
+        "avg": _float(stat.get("avg")),
+        "obp": _float(stat.get("obp")),
+        "ops": _float(stat.get("ops")),
+    }
+
+
+def _recent_start_workload(person_id, season, limit=5):
+    splits = sorted(
+        [split for split in _pitcher_game_log(person_id, season) if _is_start(split)],
+        key=lambda item: item.get("date") or "",
+        reverse=True,
+    )[:limit]
+    starts = []
+    for split in splits:
+        stat = split.get("stat", {})
+        starts.append(
+            {
+                "date": split.get("date"),
+                "opponent": split.get("opponent", {}).get("name"),
+                "inningsPitched": stat.get("inningsPitched"),
+                "pitches": _num(stat.get("numberOfPitches"), None),
+                "battersFaced": _num(stat.get("battersFaced"), None),
+                "strikeouts": _num(stat.get("strikeOuts"), None),
+            }
+        )
+    return {
+        "startsTracked": len(starts),
+        "averageOuts": _avg(
+            [_innings_to_outs(start["inningsPitched"]) for start in starts],
+            1,
+        ),
+        "averageInningsDecimal": _avg(
+            [_innings_to_outs(start["inningsPitched"]) / 3 for start in starts],
+            1,
+        ),
+        "averagePitches": _avg([start["pitches"] for start in starts]),
+        "averageBattersFaced": _avg([start["battersFaced"] for start in starts]),
+        "averageStrikeouts": _avg([start["strikeouts"] for start in starts]),
+        "starts": starts,
+    }
+
+
+def _normalize_score(value, low, high):
+    if value is None or high <= low:
+        return 0
+    return min(max((value - low) / (high - low), 0), 1)
+
+
+def _screening_score(pitcher_k_rate, opponent_k_rate, recent):
+    recent_bf = recent.get("averageBattersFaced")
+    recent_pitches = recent.get("averagePitches")
+    recent_ks = recent.get("averageStrikeouts")
+    score = (
+        0.30 * _normalize_score(pitcher_k_rate, 0.15, 0.33)
+        + 0.25 * _normalize_score(opponent_k_rate, 0.18, 0.30)
+        + 0.15 * _normalize_score(recent_bf, 18, 27)
+        + 0.15 * _normalize_score(recent_pitches, 70, 100)
+        + 0.15 * _normalize_score(recent_ks, 3, 8)
+    )
+    return round(score * 100, 1)
+
+
+def _pitcher_screening_profile(person_id, opponent_team_id, season):
+    person = _pitcher_person(person_id)
+    season_stat = _pitcher_season_stat(person_id, season)
+    hand = person.get("pitchHand", {}).get("code")
+    opponent_split = _team_hitting_split(opponent_team_id, hand, season)
+    recent = _recent_start_workload(person_id, season)
+    batters_faced = _num(season_stat.get("battersFaced"), None)
+    strikeouts = _num(season_stat.get("strikeOuts"), None)
+    walks = _num(season_stat.get("baseOnBalls"), None)
+    k_rate = _pct(strikeouts, batters_faced)
+    bb_rate = _pct(walks, batters_faced)
+
+    return {
+        "id": person_id,
+        "name": person.get("fullName"),
+        "throws": hand,
+        "season": {
+            "starts": _num(season_stat.get("gamesStarted"), None),
+            "inningsPitched": season_stat.get("inningsPitched"),
+            "pitches": _num(season_stat.get("numberOfPitches"), None),
+            "battersFaced": batters_faced,
+            "strikeouts": strikeouts,
+            "kRate": k_rate,
+            "bbRate": bb_rate,
+            "strikeoutsPer9": _float(season_stat.get("strikeoutsPer9Inn")),
+            "pitchesPerInning": _float(season_stat.get("pitchesPerInning")),
+        },
+        "recentLast5": recent,
+        "opponentHittingSplit": opponent_split,
+        "researchPriorityScore": _screening_score(
+            k_rate,
+            opponent_split.get("strikeoutRate"),
+            recent,
+        ),
+        "scoreNotes": [
+            "Research-priority score is a screening aid, not a bet recommendation.",
+            "Score weights pitcher K rate, opponent K rate vs handedness, and recent workload.",
+            "Lineups, news, weather, prop line, and price still require later checks.",
+        ],
+    }
+
+
+def _schedule(date):
+    data = _get_json(
+        f"{MLB_BASE}/schedule",
+        {"sportId": 1, "date": date, "hydrate": "probablePitcher,team,venue"},
+    )
+    dates = data.get("dates", [])
+    return dates[0].get("games", []) if dates else []
+
+
+def _normalize_team_code(value):
+    aliases = {"CHW": "CWS", "WAS": "WSH", "AZ": "ARI"}
+    code = str(value or "").strip().upper()
+    return aliases.get(code, code)
+
+
+def _requested_matchups(raw):
+    if not raw:
+        return []
+    matchups = []
+    for item in str(raw).split(","):
+        away, separator, home = item.partition("@")
+        if separator and away.strip() and home.strip():
+            matchups.append(
+                (_normalize_team_code(away), _normalize_team_code(home))
+            )
+    return matchups
+
+
+def _format_screening_game(game, season):
+    away = game.get("teams", {}).get("away", {})
+    home = game.get("teams", {}).get("home", {})
+    sides = [("away", away, home), ("home", home, away)]
+    pitchers = []
+
+    for side, team_side, opponent_side in sides:
+        probable = team_side.get("probablePitcher")
+        if not probable:
+            pitchers.append(
+                {
+                    "side": side,
+                    "team": team_side.get("team", {}).get("abbreviation"),
+                    "opponent": opponent_side.get("team", {}).get("abbreviation"),
+                    "available": False,
+                    "reason": "Probable starter is not listed yet.",
+                }
+            )
+            continue
+
+        try:
+            profile = _pitcher_screening_profile(
+                probable["id"],
+                opponent_side.get("team", {}).get("id"),
+                season,
+            )
+            profile.update(
+                {
+                    "side": side,
+                    "team": team_side.get("team", {}).get("abbreviation"),
+                    "opponent": opponent_side.get("team", {}).get("abbreviation"),
+                    "available": True,
+                }
+            )
+            pitchers.append(profile)
+        except requests.RequestException:
+            pitchers.append(
+                {
+                    "side": side,
+                    "team": team_side.get("team", {}).get("abbreviation"),
+                    "opponent": opponent_side.get("team", {}).get("abbreviation"),
+                    "id": probable.get("id"),
+                    "name": probable.get("fullName"),
+                    "available": False,
+                    "reason": "MLB Stats API screening data unavailable.",
+                }
+            )
+
+    available_scores = [
+        pitcher["researchPriorityScore"]
+        for pitcher in pitchers
+        if pitcher.get("researchPriorityScore") is not None
+    ]
+    return {
+        "gamePk": game.get("gamePk"),
+        "gameDate": game.get("gameDate"),
+        "status": game.get("status", {}).get("detailedState"),
+        "matchup": (
+            f"{away.get('team', {}).get('abbreviation')}"
+            f"@{home.get('team', {}).get('abbreviation')}"
+        ),
+        "awayTeam": away.get("team", {}).get("name"),
+        "homeTeam": home.get("team", {}).get("name"),
+        "venue": game.get("venue", {}).get("name"),
+        "pitchers": pitchers,
+        "gameResearchPriorityScore": max(available_scores) if available_scores else None,
+    }
 
 
 def _is_whiff(event):
@@ -363,6 +626,74 @@ def _summary(starts, line):
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": "mlb-pitcher-action"})
+
+
+@app.get("/game-screening")
+def game_screening():
+    date = request.args.get("date") or datetime.now().strftime("%Y-%m-%d")
+    season = request.args.get("season") or date[:4]
+    requested = _requested_matchups(request.args.get("matchups"))
+    games = _schedule(date)
+
+    if requested:
+        requested_set = set(requested)
+        selected_games = []
+        found = set()
+        for game in games:
+            away = _normalize_team_code(
+                game.get("teams", {}).get("away", {}).get("team", {}).get("abbreviation")
+            )
+            home = _normalize_team_code(
+                game.get("teams", {}).get("home", {}).get("team", {}).get("abbreviation")
+            )
+            if (away, home) in requested_set:
+                selected_games.append(game)
+                found.add((away, home))
+        unmatched = [
+            f"{away}@{home}"
+            for away, home in requested
+            if (away, home) not in found
+        ]
+    else:
+        selected_games = games
+        unmatched = []
+
+    screened = []
+    with ThreadPoolExecutor(max_workers=min(max(len(selected_games), 1), 8)) as executor:
+        futures = [
+            executor.submit(_format_screening_game, game, season)
+            for game in selected_games
+        ]
+        for future in as_completed(futures):
+            screened.append(future.result())
+
+    screened = sorted(
+        screened,
+        key=lambda game: game.get("gameResearchPriorityScore") or 0,
+        reverse=True,
+    )
+    for rank, game in enumerate(screened, start=1):
+        game["researchRank"] = rank
+
+    return jsonify(
+        {
+            "date": date,
+            "season": season,
+            "screeningOnly": True,
+            "requestedMatchups": [
+                f"{away}@{home}" for away, home in requested
+            ],
+            "unmatchedRequestedMatchups": unmatched,
+            "gamesReturned": len(screened),
+            "games": screened,
+            "notes": [
+                "This endpoint screens games for deeper pitcher-K research. It does not recommend bets.",
+                "Research-priority scores are heuristic sorting aids, not projected win probabilities.",
+                "Send only screenshot-provided matchups in the matchups query when screening a Bet365 screenshot.",
+                "Confirm lineups, injury news, weather, Bet365 pitcher-K lines, and prices before any bet decision.",
+            ],
+        }
+    )
 
 
 @app.get("/pitcher-last-starts")
