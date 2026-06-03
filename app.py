@@ -1,6 +1,7 @@
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from math import ceil, floor, sqrt
 
 import requests
 from flask import Flask, jsonify, request
@@ -117,6 +118,15 @@ def _avg(values, digits=1):
     return round(sum(values) / len(values), digits)
 
 
+def _stddev(values, digits=2):
+    values = [value for value in values if value is not None]
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return round(sqrt(variance), digits)
+
+
 def _pct(part, whole):
     if not whole:
         return None
@@ -202,27 +212,17 @@ def _recent_start_workload(person_id, season, limit=5):
                 "strikeouts": _num(stat.get("strikeOuts"), None),
             }
         )
-    return {
-        "startsTracked": len(starts),
-        "averageOuts": _avg(
-            [_innings_to_outs(start["inningsPitched"]) for start in starts],
-            1,
-        ),
-        "averageInningsDecimal": _avg(
-            [_innings_to_outs(start["inningsPitched"]) / 3 for start in starts],
-            1,
-        ),
-        "averagePitches": _avg([start["pitches"] for start in starts]),
-        "averageBattersFaced": _avg([start["battersFaced"] for start in starts]),
-        "averageStrikeouts": _avg([start["strikeouts"] for start in starts]),
-        "starts": starts,
-    }
+    return _workload_summary(starts)
 
 
 def _normalize_score(value, low, high):
     if value is None or high <= low:
         return 0
     return min(max((value - low) / (high - low), 0), 1)
+
+
+def _clamp(value, low, high):
+    return min(max(value, low), high)
 
 
 def _screening_score(pitcher_k_rate, opponent_k_rate, recent):
@@ -239,43 +239,352 @@ def _screening_score(pitcher_k_rate, opponent_k_rate, recent):
     return round(score * 100, 1)
 
 
+def _workload_summary(starts):
+    return {
+        "startsTracked": len(starts),
+        "averageOuts": _avg(
+            [_innings_to_outs(start["inningsPitched"]) for start in starts],
+            1,
+        ),
+        "averageInningsDecimal": _avg(
+            [_innings_to_outs(start["inningsPitched"]) / 3 for start in starts],
+            1,
+        ),
+        "averagePitches": _avg([start["pitches"] for start in starts]),
+        "averageBattersFaced": _avg([start["battersFaced"] for start in starts]),
+        "averageStrikeouts": _avg([start["strikeouts"] for start in starts]),
+        "strikeoutRate": _pct(
+            sum(_num(start.get("strikeouts"), 0) for start in starts),
+            sum(_num(start.get("battersFaced"), 0) for start in starts),
+        ),
+        "battersFacedStdDev": _stddev([start["battersFaced"] for start in starts]),
+        "strikeoutsStdDev": _stddev([start["strikeouts"] for start in starts]),
+        "starts": starts,
+    }
+
+
+def _weighted_available(items, digits=1):
+    available = [(value, weight) for value, weight in items if value is not None]
+    weight_total = sum(weight for _, weight in available)
+    if not available or not weight_total:
+        return None
+    return round(sum(value * weight for value, weight in available) / weight_total, digits)
+
+
+def _expected_batters_faced(season, recent_last5, recent_last10):
+    season_starts = season.get("starts")
+    season_bf = season.get("battersFaced")
+    season_bf_per_start = (
+        round(season_bf / season_starts, 1)
+        if season_bf is not None and season_starts
+        else None
+    )
+    last5_bf = recent_last5.get("averageBattersFaced")
+    last10_bf = recent_last10.get("averageBattersFaced")
+    base = _weighted_available(
+        [
+            (last5_bf, 0.50),
+            (last10_bf, 0.30),
+            (season_bf_per_start, 0.20),
+        ],
+        1,
+    )
+
+    if base is None:
+        return {
+            "expectedBattersFaced": None,
+            "baseExpectedBattersFaced": None,
+            "seasonBattersFacedPerStart": season_bf_per_start,
+            "adjustments": [],
+            "notes": ["Expected BF unavailable because workload data is missing."],
+        }
+
+    adjustments = []
+    expected = base
+    last5_pitches = recent_last5.get("averagePitches")
+    last10_pitches = recent_last10.get("averagePitches")
+    last10_bf = recent_last10.get("averageBattersFaced")
+    pitches_per_bf = (
+        round(last10_pitches / last10_bf, 2)
+        if last10_pitches is not None and last10_bf
+        else None
+    )
+
+    if last5_pitches is not None:
+        if last5_pitches >= 94:
+            adjustments.append({"reason": "stable high recent pitch count", "value": 0.3})
+        elif last5_pitches < 75:
+            adjustments.append({"reason": "light recent pitch count", "value": -1.0})
+        elif last5_pitches < 84:
+            adjustments.append({"reason": "below-average recent pitch count", "value": -0.5})
+
+    if pitches_per_bf is not None:
+        if pitches_per_bf >= 4.45:
+            adjustments.append({"reason": "inefficient pitches per batter faced", "value": -0.8})
+        elif pitches_per_bf >= 4.25:
+            adjustments.append({"reason": "mild efficiency drag", "value": -0.4})
+        elif pitches_per_bf <= 3.75:
+            adjustments.append({"reason": "efficient recent BF conversion", "value": 0.3})
+
+    bb_rate = season.get("bbRate")
+    if bb_rate is not None:
+        if bb_rate >= 0.105:
+            adjustments.append({"reason": "high walk-rate workload risk", "value": -0.8})
+        elif bb_rate >= 0.09:
+            adjustments.append({"reason": "walk-rate efficiency concern", "value": -0.4})
+        elif bb_rate <= 0.055:
+            adjustments.append({"reason": "low walk-rate efficiency support", "value": 0.2})
+
+    short_recent_starts = sum(
+        1
+        for start in recent_last5.get("starts", [])
+        if start.get("battersFaced") is not None and start["battersFaced"] < 20
+    )
+    if short_recent_starts >= 2:
+        adjustments.append({"reason": "multiple recent short starts", "value": -0.7})
+
+    for adjustment in adjustments:
+        expected += adjustment["value"]
+
+    expected = round(_clamp(expected, 12, 30), 1)
+    return {
+        "expectedBattersFaced": expected,
+        "baseExpectedBattersFaced": base,
+        "seasonBattersFacedPerStart": season_bf_per_start,
+        "pitchesPerBatterFacedLast10": pitches_per_bf,
+        "adjustments": adjustments,
+        "notes": [
+            "Base Expected BF uses 50% last 5 BF, 30% last 10 BF, and 20% season BF/start.",
+            "Workload can improve ranking only through Expected Ks; low-K pitchers are not promoted for volume alone.",
+        ],
+    }
+
+
+def _estimated_k_probability(season, opponent_split, recent_last10):
+    base_k_rate = season.get("kRate")
+    if base_k_rate is None:
+        return {
+            "estimatedKRate": None,
+            "baseKRate": None,
+            "components": {},
+            "notes": ["Estimated K% unavailable because season K rate is missing."],
+        }
+
+    opponent_k_rate = opponent_split.get("strikeoutRate")
+    matchup_adjustment = (
+        round(_clamp((opponent_k_rate - 0.22) * 0.6, -0.03, 0.03), 3)
+        if opponent_k_rate is not None
+        else 0
+    )
+    recent_k_rate = recent_last10.get("strikeoutRate")
+    recent_form_adjustment = (
+        round(_clamp((recent_k_rate - base_k_rate) * 0.35, -0.02, 0.02), 3)
+        if recent_k_rate is not None
+        else 0
+    )
+    # Pitch-level whiff/CSW and velocity are reviewed in Stage 2 to avoid
+    # making the screenshot screen too slow and noisy.
+    pitch_quality_adjustment = 0
+
+    estimated = round(
+        _clamp(
+            base_k_rate
+            + matchup_adjustment
+            + recent_form_adjustment
+            + pitch_quality_adjustment,
+            0.08,
+            0.42,
+        ),
+        3,
+    )
+    return {
+        "estimatedKRate": estimated,
+        "baseKRate": base_k_rate,
+        "components": {
+            "opponentMatchupAdjustment": matchup_adjustment,
+            "recentFormAdjustment": recent_form_adjustment,
+            "pitchQualityAdjustment": pitch_quality_adjustment,
+            "redFlagPenalty": 0,
+        },
+        "recentKRateLast10Starts": recent_k_rate,
+        "notes": [
+            "Estimated K% starts with pitcher season K%; matchup and recent form only adjust it.",
+            "Opponent adjustment is capped from -3% to +3%. Recent-form adjustment is capped from -2% to +2%.",
+            "Pitch-quality adjustment is deferred to Stage 2 pitch mix/velocity review.",
+        ],
+    }
+
+
+def _expected_strikeout_range(expected_ks, confidence_label, recent_last10):
+    if expected_ks is None:
+        return None
+    width = {
+        "Low": 2.2,
+        "Medium": 1.9,
+        "Medium+": 1.7,
+        "High": 1.5,
+        "High+": 1.4,
+    }.get(confidence_label, 1.9)
+    volatility = recent_last10.get("strikeoutsStdDev")
+    if volatility is not None and volatility >= 2.4:
+        width += 0.5
+    elif volatility is not None and volatility <= 1.2:
+        width -= 0.2
+    low = max(0, floor(expected_ks - width))
+    high = max(low, ceil(expected_ks + width))
+    return {"low": low, "high": high, "display": f"{low}-{high}"}
+
+
+def _confidence_label(season, opponent_split, recent_last5, recent_last10, expected_bf, estimated_k_rate):
+    points = 0.0
+    k_rate = season.get("kRate")
+    opponent_k_rate = opponent_split.get("strikeoutRate")
+    starts_tracked = recent_last10.get("startsTracked") or 0
+    last5_pitches = recent_last5.get("averagePitches")
+    bf_stddev = recent_last10.get("battersFacedStdDev")
+    bb_rate = season.get("bbRate")
+
+    if k_rate is not None:
+        if k_rate >= 0.28:
+            points += 2.0
+        elif k_rate >= 0.25:
+            points += 1.4
+        elif k_rate >= 0.22:
+            points += 0.7
+        elif k_rate < 0.18:
+            points -= 1.0
+
+    if opponent_k_rate is not None:
+        if opponent_k_rate >= 0.25:
+            points += 1.0
+        elif opponent_k_rate >= 0.23:
+            points += 0.5
+        elif opponent_k_rate < 0.20:
+            points -= 0.8
+
+    if expected_bf is not None:
+        if expected_bf >= 24:
+            points += 1.0
+        elif expected_bf >= 22:
+            points += 0.5
+        elif expected_bf < 20:
+            points -= 1.0
+
+    if starts_tracked >= 8:
+        points += 0.5
+    elif starts_tracked < 5:
+        points -= 0.8
+
+    if last5_pitches is not None and last5_pitches < 80:
+        points -= 0.8
+    if bf_stddev is not None and bf_stddev >= 4:
+        points -= 0.5
+    if bb_rate is not None and bb_rate >= 0.105:
+        points -= 0.7
+    if estimated_k_rate is not None and estimated_k_rate >= 0.29:
+        points += 0.5
+
+    if points >= 3.2:
+        label = "High"
+    elif points >= 2.1:
+        label = "Medium+"
+    elif points >= 0.8:
+        label = "Medium"
+    else:
+        label = "Low"
+
+    return {
+        "label": label,
+        "score": round(points, 1),
+        "notes": [
+            "High+ is applied only after ranking when a High profile separates from the board.",
+            "Confidence is research confidence, not bet confidence.",
+        ],
+    }
+
+
 def _pitcher_screening_profile(person_id, opponent_team_id, season):
     person = _pitcher_person(person_id)
     season_stat = _pitcher_season_stat(person_id, season)
     hand = person.get("pitchHand", {}).get("code")
     opponent_split = _team_hitting_split(opponent_team_id, hand, season)
-    recent = _recent_start_workload(person_id, season)
     batters_faced = _num(season_stat.get("battersFaced"), None)
     strikeouts = _num(season_stat.get("strikeOuts"), None)
     walks = _num(season_stat.get("baseOnBalls"), None)
     k_rate = _pct(strikeouts, batters_faced)
     bb_rate = _pct(walks, batters_faced)
+    season_payload = {
+        "starts": _num(season_stat.get("gamesStarted"), None),
+        "inningsPitched": season_stat.get("inningsPitched"),
+        "pitches": _num(season_stat.get("numberOfPitches"), None),
+        "battersFaced": batters_faced,
+        "strikeouts": strikeouts,
+        "kRate": k_rate,
+        "bbRate": bb_rate,
+        "strikeoutsPer9": _float(season_stat.get("strikeoutsPer9Inn")),
+        "pitchesPerInning": _float(season_stat.get("pitchesPerInning")),
+    }
+    recent_last10 = _recent_start_workload(person_id, season, limit=10)
+    recent_last5 = _workload_summary(recent_last10.get("starts", [])[:5])
+    expected_bf = _expected_batters_faced(
+        season_payload,
+        recent_last5,
+        recent_last10,
+    )
+    k_probability = _estimated_k_probability(
+        season_payload,
+        opponent_split,
+        recent_last10,
+    )
+    expected_batters_faced = expected_bf.get("expectedBattersFaced")
+    estimated_k_rate = k_probability.get("estimatedKRate")
+    expected_ks = (
+        round(expected_batters_faced * estimated_k_rate, 1)
+        if expected_batters_faced is not None and estimated_k_rate is not None
+        else None
+    )
+    confidence = _confidence_label(
+        season_payload,
+        opponent_split,
+        recent_last5,
+        recent_last10,
+        expected_batters_faced,
+        estimated_k_rate,
+    )
+    expected_range = _expected_strikeout_range(
+        expected_ks,
+        confidence.get("label"),
+        recent_last10,
+    )
 
     return {
         "id": person_id,
         "name": person.get("fullName"),
         "throws": hand,
-        "season": {
-            "starts": _num(season_stat.get("gamesStarted"), None),
-            "inningsPitched": season_stat.get("inningsPitched"),
-            "pitches": _num(season_stat.get("numberOfPitches"), None),
-            "battersFaced": batters_faced,
-            "strikeouts": strikeouts,
-            "kRate": k_rate,
-            "bbRate": bb_rate,
-            "strikeoutsPer9": _float(season_stat.get("strikeoutsPer9Inn")),
-            "pitchesPerInning": _float(season_stat.get("pitchesPerInning")),
-        },
-        "recentLast5": recent,
+        "season": season_payload,
+        "recentLast5": recent_last5,
+        "recentLast10": recent_last10,
         "opponentHittingSplit": opponent_split,
         "researchPriorityScore": _screening_score(
             k_rate,
             opponent_split.get("strikeoutRate"),
-            recent,
+            recent_last5,
         ),
+        "expectedKModel": {
+            "estimatedKRate": estimated_k_rate,
+            "expectedBattersFaced": expected_batters_faced,
+            "expectedStrikeouts": expected_ks,
+            "expectedStrikeoutRange": expected_range,
+            "estimatedKProbability": k_probability,
+            "expectedBattersFacedModel": expected_bf,
+            "confidence": confidence,
+            "lineupStatus": "Unavailable from helper",
+            "lineupConfidenceRule": "Projected lineups can support research, but projected or unavailable lineups should reduce final confidence.",
+        },
         "scoreNotes": [
             "Research-priority score is a screening aid, not a bet recommendation.",
             "Score weights pitcher K rate, opponent K rate vs handedness, and recent workload.",
+            "Expected Ks is the preferred Stage 1 ranking field when available.",
             "Lineups, news, weather, prop line, and price still require later checks.",
         ],
     }
@@ -378,6 +687,179 @@ def _format_screening_game(game, season):
     }
 
 
+def _gap_label(gap):
+    if gap is None:
+        return None
+    if gap < 0.30:
+        return "basically tied"
+    if gap < 0.60:
+        return "small edge"
+    if gap < 1.00:
+        return "meaningful edge"
+    return "major edge"
+
+
+def _tie_breaker_score(pitcher):
+    season = pitcher.get("season", {})
+    opponent = pitcher.get("opponentHittingSplit", {})
+    recent = pitcher.get("recentLast5", {})
+    model = pitcher.get("expectedKModel", {})
+    confidence = model.get("confidence", {})
+    confidence_score = confidence.get("score") or 0
+    score = (
+        0.35 * _normalize_score(season.get("kRate"), 0.15, 0.33)
+        + 0.25 * _normalize_score(opponent.get("strikeoutRate"), 0.18, 0.30)
+        + 0.20 * _normalize_score(recent.get("averagePitches"), 70, 100)
+        + 0.20 * _normalize_score(confidence_score, 0, 4)
+    )
+    return round(score * 100, 1)
+
+
+def _sort_by_expected_ks_with_ties(pitchers):
+    base = sorted(
+        pitchers,
+        key=lambda pitcher: (
+            pitcher.get("expectedStrikeouts")
+            if pitcher.get("expectedStrikeouts") is not None
+            else -1,
+            pitcher.get("tieBreakerScore") or 0,
+        ),
+        reverse=True,
+    )
+    clusters = []
+    current = []
+    anchor = None
+    for pitcher in base:
+        expected_ks = pitcher.get("expectedStrikeouts")
+        if expected_ks is None:
+            if current:
+                clusters.append(current)
+                current = []
+                anchor = None
+            clusters.append([pitcher])
+            continue
+        if anchor is None:
+            anchor = expected_ks
+            current = [pitcher]
+            continue
+        if anchor - expected_ks < 0.30:
+            current.append(pitcher)
+        else:
+            clusters.append(current)
+            anchor = expected_ks
+            current = [pitcher]
+    if current:
+        clusters.append(current)
+
+    ranked = []
+    for cluster in clusters:
+        if len(cluster) > 1:
+            cluster = sorted(
+                cluster,
+                key=lambda pitcher: pitcher.get("tieBreakerScore") or 0,
+                reverse=True,
+            )
+            for pitcher in cluster:
+                pitcher["rankingCluster"] = "Expected-K gap under 0.30; tie-breakers ordered this cluster."
+        ranked.extend(cluster)
+    return ranked
+
+
+def _stage1_group(pitcher):
+    expected_ks = pitcher.get("expectedStrikeouts")
+    estimated_k_rate = pitcher.get("estimatedKRate")
+    expected_bf = pitcher.get("expectedBattersFaced")
+    confidence = pitcher.get("confidence")
+
+    if expected_ks is None:
+        return "PASS FOR NOW"
+    if expected_ks >= 5.4 and confidence != "Low":
+        return "RESEARCH"
+    if (
+        expected_ks >= 5.0
+        and estimated_k_rate is not None
+        and estimated_k_rate >= 0.24
+        and expected_bf is not None
+        and expected_bf >= 22
+        and confidence in {"Medium+", "High", "High+"}
+    ):
+        return "RESEARCH"
+    if expected_ks >= 4.4 or confidence in {"Medium+", "High", "High+"}:
+        return "BORDERLINE"
+    return "PASS FOR NOW"
+
+
+def _group_reason(pitcher):
+    expected_ks = pitcher.get("expectedStrikeouts")
+    estimated_k_rate = pitcher.get("estimatedKRate")
+    expected_bf = pitcher.get("expectedBattersFaced")
+    opponent_k_rate = pitcher.get("opponentKRateVsHand")
+    confidence = pitcher.get("confidence")
+    if expected_ks is None:
+        return "Missing expected-K estimate."
+    if pitcher.get("stage1Group") == "RESEARCH":
+        return "Expected Ks, K skill, matchup, and workload are strong enough for pitcher-K screenshots."
+    if pitcher.get("stage1Group") == "BORDERLINE":
+        concerns = []
+        if expected_ks < 5.0:
+            concerns.append("expected Ks below primary research group")
+        if estimated_k_rate is not None and estimated_k_rate < 0.24:
+            concerns.append("estimated K% is not strong")
+        if expected_bf is not None and expected_bf < 22:
+            concerns.append("expected BF is not strong")
+        if opponent_k_rate is not None and opponent_k_rate < 0.22:
+            concerns.append("opponent K split is modest")
+        return "; ".join(concerns[:2]) or "Interesting but not clean enough before line/price."
+    reasons = []
+    if estimated_k_rate is not None and estimated_k_rate < 0.21:
+        reasons.append("low estimated K%")
+    if expected_bf is not None and expected_bf < 21:
+        reasons.append("limited expected BF")
+    if expected_ks < 4.4:
+        reasons.append("expected Ks below screen threshold")
+    if confidence == "Low":
+        reasons.append("low research confidence")
+    return "; ".join(reasons[:2]) or "Does not clear the Stage 1 research threshold."
+
+
+def _rank_gap_notes(ranked):
+    notes = [
+        "Expected-K gap guide: under 0.30 = basically tied; 0.30-0.59 = small edge; 0.60-0.99 = meaningful edge; 1.00+ = major edge.",
+    ]
+    expected_values = [
+        pitcher.get("expectedStrikeouts")
+        for pitcher in ranked
+        if pitcher.get("expectedStrikeouts") is not None
+    ]
+    if len(expected_values) < 2:
+        return notes
+    top_gap = round(abs(expected_values[0] - expected_values[1]), 1)
+    notes.append(
+        f"Ranks 1-2 are separated by {top_gap} expected Ks: {_gap_label(top_gap)}."
+    )
+    tight_clusters = []
+    cluster_start = 0
+    cluster_values = []
+    for index, expected in enumerate(expected_values):
+        proposed = cluster_values + [expected]
+        if proposed and max(proposed) - min(proposed) < 0.30:
+            cluster_values = proposed
+            continue
+        if len(cluster_values) > 1:
+            tight_clusters.append((cluster_start + 1, index))
+        cluster_start = index
+        cluster_values = [expected]
+    if len(cluster_values) > 1:
+        tight_clusters.append((cluster_start + 1, len(expected_values)))
+    if tight_clusters:
+        notes.append(
+            "Tight ranking clusters: "
+            + ", ".join(f"Ranks {start}-{end}" for start, end in tight_clusters)
+            + " are within 0.30 expected Ks, so tie-breakers matter."
+        )
+    return notes
+
+
 def _rank_screening_pitchers(games, limit=10, minimum_score=45):
     pitchers = []
     for game in games:
@@ -387,41 +869,99 @@ def _rank_screening_pitchers(games, limit=10, minimum_score=45):
                 continue
 
             recent = pitcher.get("recentLast5", {})
+            recent10 = pitcher.get("recentLast10", {})
             opponent = pitcher.get("opponentHittingSplit", {})
             season = pitcher.get("season", {})
+            model = pitcher.get("expectedKModel", {})
+            estimated = model.get("estimatedKProbability", {})
+            expected_bf_model = model.get("expectedBattersFacedModel", {})
+            confidence = model.get("confidence", {})
+            expected_range = model.get("expectedStrikeoutRange") or {}
+            flat_pitcher = {
+                "pitcherId": pitcher.get("id"),
+                "pitcher": pitcher.get("name"),
+                "team": pitcher.get("team"),
+                "opponent": pitcher.get("opponent"),
+                "matchup": game.get("matchup"),
+                "gameDate": game.get("gameDate"),
+                "venue": game.get("venue"),
+                "throws": pitcher.get("throws"),
+                "researchPriorityScore": score,
+                "seasonKRate": season.get("kRate"),
+                "seasonStrikeoutsPer9": season.get("strikeoutsPer9"),
+                "opponentSplit": opponent.get("split"),
+                "opponentKRateVsHand": opponent.get("strikeoutRate"),
+                "baseKRate": estimated.get("baseKRate"),
+                "opponentMatchupAdjustment": estimated.get("components", {}).get("opponentMatchupAdjustment"),
+                "recentFormAdjustment": estimated.get("components", {}).get("recentFormAdjustment"),
+                "pitchQualityAdjustment": estimated.get("components", {}).get("pitchQualityAdjustment"),
+                "estimatedKRate": model.get("estimatedKRate"),
+                "expectedBattersFaced": model.get("expectedBattersFaced"),
+                "expectedStrikeouts": model.get("expectedStrikeouts"),
+                "expectedStrikeoutRange": expected_range.get("display"),
+                "confidence": confidence.get("label"),
+                "confidenceScore": confidence.get("score"),
+                "lineupStatus": model.get("lineupStatus"),
+                "lineupConfidenceRule": model.get("lineupConfidenceRule"),
+                "expectedBFBase": expected_bf_model.get("baseExpectedBattersFaced"),
+                "expectedBFAdjustments": expected_bf_model.get("adjustments"),
+                "seasonBattersFacedPerStart": expected_bf_model.get("seasonBattersFacedPerStart"),
+                "pitchesPerBatterFacedLast10": expected_bf_model.get("pitchesPerBatterFacedLast10"),
+                "recentLast5AverageKs": recent.get("averageStrikeouts"),
+                "recentLast5AveragePitches": recent.get("averagePitches"),
+                "recentLast5AverageBattersFaced": recent.get("averageBattersFaced"),
+                "recentLast5AverageInningsDecimal": recent.get("averageInningsDecimal"),
+                "recentLast10AverageKs": recent10.get("averageStrikeouts"),
+                "recentLast10AveragePitches": recent10.get("averagePitches"),
+                "recentLast10AverageBattersFaced": recent10.get("averageBattersFaced"),
+                "recentLast10AverageInningsDecimal": recent10.get("averageInningsDecimal"),
+                "recommendedForDeeperResearch": False,
+                "screeningNotes": [
+                    "Use Expected Ks as the primary Stage 1 ranking field when available.",
+                    "Use measurable screening data only. Reputation or name value is not a reason to research a pitcher.",
+                    "This is a research shortlist, not a bet recommendation.",
+                    "Bet365 pitcher-K line, price, lineup, news, and weather still require later checks.",
+                ],
+            }
+            flat_pitcher["tieBreakerScore"] = _tie_breaker_score(pitcher)
             pitchers.append(
-                {
-                    "pitcherId": pitcher.get("id"),
-                    "pitcher": pitcher.get("name"),
-                    "team": pitcher.get("team"),
-                    "opponent": pitcher.get("opponent"),
-                    "matchup": game.get("matchup"),
-                    "gameDate": game.get("gameDate"),
-                    "venue": game.get("venue"),
-                    "throws": pitcher.get("throws"),
-                    "researchPriorityScore": score,
-                    "seasonKRate": season.get("kRate"),
-                    "seasonStrikeoutsPer9": season.get("strikeoutsPer9"),
-                    "opponentSplit": opponent.get("split"),
-                    "opponentKRateVsHand": opponent.get("strikeoutRate"),
-                    "recentLast5AverageKs": recent.get("averageStrikeouts"),
-                    "recentLast5AveragePitches": recent.get("averagePitches"),
-                    "recentLast5AverageBattersFaced": recent.get("averageBattersFaced"),
-                    "recentLast5AverageInningsDecimal": recent.get("averageInningsDecimal"),
-                    "recommendedForDeeperResearch": score >= minimum_score,
-                    "screeningNotes": [
-                        "Use measurable screening data only. Reputation or name value is not a reason to research a pitcher.",
-                        "This is a research shortlist, not a bet recommendation.",
-                        "Bet365 pitcher-K line, price, lineup, news, and weather still require later checks.",
-                    ],
-                }
+                flat_pitcher
             )
 
-    ranked = sorted(
-        pitchers,
-        key=lambda pitcher: pitcher.get("researchPriorityScore") or 0,
-        reverse=True,
-    )
+    ranked = _sort_by_expected_ks_with_ties(pitchers)
+    if ranked:
+        top_expected = ranked[0].get("expectedStrikeouts")
+        second_expected = ranked[1].get("expectedStrikeouts") if len(ranked) > 1 else None
+        top_gap = (
+            round(top_expected - second_expected, 1)
+            if top_expected is not None and second_expected is not None
+            else None
+        )
+        if (
+            ranked[0].get("confidence") == "High"
+            and ranked[0].get("expectedStrikeouts") is not None
+            and ranked[0]["expectedStrikeouts"] >= 6.0
+            and (top_gap is None or top_gap >= 0.60 or ranked[0]["expectedStrikeouts"] >= 6.7)
+        ):
+            ranked[0]["confidence"] = "High+"
+            ranked[0]["screeningNotes"].append(
+                "High+ means top-tier research priority, not a bet recommendation."
+            )
+
+    for index, pitcher in enumerate(ranked):
+        previous_expected = ranked[index - 1].get("expectedStrikeouts") if index else None
+        current_expected = pitcher.get("expectedStrikeouts")
+        gap = (
+            round(abs(previous_expected - current_expected), 1)
+            if previous_expected is not None and current_expected is not None
+            else None
+        )
+        pitcher["expectedKGapFromPrevious"] = gap
+        pitcher["expectedKGapLabel"] = _gap_label(gap) if gap is not None else None
+        pitcher["stage1Group"] = _stage1_group(pitcher)
+        pitcher["recommendedForDeeperResearch"] = pitcher["stage1Group"] == "RESEARCH"
+        pitcher["groupReason"] = _group_reason(pitcher)
+
     recommended = [
         pitcher
         for pitcher in ranked
@@ -439,7 +979,16 @@ def _rank_screening_pitchers(games, limit=10, minimum_score=45):
     for rank, pitcher in enumerate(not_selected, start=len(recommended) + 1):
         pitcher["screenRank"] = rank
 
-    return recommended, not_selected
+    screening_groups = {
+        "research": [pitcher for pitcher in ranked if pitcher.get("stage1Group") == "RESEARCH"],
+        "borderline": [pitcher for pitcher in ranked if pitcher.get("stage1Group") == "BORDERLINE"],
+        "passForNow": [pitcher for pitcher in ranked if pitcher.get("stage1Group") == "PASS FOR NOW"],
+    }
+    for group_pitchers in screening_groups.values():
+        for rank, pitcher in enumerate(group_pitchers, start=1):
+            pitcher["groupRank"] = rank
+
+    return recommended, not_selected, screening_groups, _rank_gap_notes(ranked)
 
 
 def _is_whiff(event):
@@ -738,7 +1287,12 @@ def game_screening():
     )
     for rank, game in enumerate(screened, start=1):
         game["researchRank"] = rank
-    recommended_pitchers, not_selected_pitchers = _rank_screening_pitchers(screened)
+    (
+        recommended_pitchers,
+        not_selected_pitchers,
+        screening_groups,
+        rank_gap_notes,
+    ) = _rank_screening_pitchers(screened)
 
     return jsonify(
         {
@@ -753,14 +1307,18 @@ def game_screening():
             "games": screened,
             "recommendedPitchers": recommended_pitchers,
             "notSelectedPitchers": not_selected_pitchers,
+            "screeningGroups": screening_groups,
+            "rankGapNotes": rank_gap_notes,
             "notes": [
                 "This endpoint screens games for deeper pitcher-K research. It does not recommend bets.",
-                "Research-priority scores are heuristic sorting aids, not projected win probabilities.",
-                "Recommended pitchers are individual research targets scoring 45 or higher, up to a maximum of 10.",
-                "The shortlist may contain fewer than 10 pitchers when fewer pitchers clear the research threshold.",
+                "Expected Ks is the preferred Stage 1 ranking field; the old research-priority score remains as a comparison aid.",
+                "Recommended pitchers come from the RESEARCH group, up to a maximum of 10.",
+                "Every screened pitcher is also returned in screeningGroups: research, borderline, or passForNow.",
+                "Expected-K gap guide: under 0.30 = tied; 0.30-0.59 = small edge; 0.60-0.99 = meaningful edge; 1.00+ = major edge.",
                 "Use measurable screening data only. Reputation or name value is not a reason to research a pitcher.",
                 "Send only screenshot-provided matchups in the matchups query when screening a Bet365 screenshot.",
-                "Confirm lineups, injury news, weather, Bet365 pitcher-K lines, and prices before any bet decision.",
+                "Projected lineups can support research with an uncertainty haircut, but never treat projected lineups as confirmed.",
+                "Confirm lineups, injury news, weather, Bet365 pitcher-K lines, and prices before any final bet decision.",
             ],
         }
     )
