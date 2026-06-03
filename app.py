@@ -1064,6 +1064,7 @@ def _dashboard_row(pitcher):
     return {
         "rank": pitcher.get("rank"),
         "pitcher": pitcher.get("pitcher"),
+        "team": pitcher.get("team") or "N/A",
         "matchup": pitcher.get("matchup"),
         "hand": pitcher.get("throws") or "N/A",
         "baseK": _format_rate(pitcher.get("baseKRate")),
@@ -1104,6 +1105,7 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
     display_columns = [
         {"key": "rank", "label": "Rank"},
         {"key": "pitcher", "label": "Pitcher"},
+        {"key": "team", "label": "Team"},
         {"key": "matchup", "label": "Matchup"},
         {"key": "hand", "label": "Hand"},
         {"key": "baseK", "label": "Base K%"},
@@ -1131,7 +1133,7 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
     if borderline_rows:
         what_next.append("Optional: include BORDERLINE pitchers only if you want to check for unusually soft Bet365 lines.")
 
-    return {
+    dashboard = {
         "title": "MLB Pitcher-K Screen",
         "subtitle": "Research only. No bets yet.",
         "slateRead": {
@@ -1167,11 +1169,106 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
             "Use this section order: Slate Read, rankGapNotes, RESEARCH, BORDERLINE, PASS FOR NOW, What I Need Next.",
             "Use these rows in the returned order.",
             "Use every displayColumns entry for each table, in the returned order.",
+            "Use stage1ReportMarkdown exactly when available.",
             "Copy confidence, matchup, gapNote, and whyConcern exactly.",
             "Do not rename teams, reorder rows, upgrade confidence, or rewrite group reasons.",
             "High+ is research priority only, not a bet.",
         ],
     }
+    dashboard["stage1ReportMarkdown"] = _stage1_report_markdown(dashboard)
+    return dashboard
+
+
+def _markdown_cell(value):
+    text = "" if value is None else str(value)
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _markdown_table(headers, rows):
+    header_line = "| " + " | ".join(_markdown_cell(header) for header in headers) + " |"
+    separator = "| " + " | ".join("---" for _ in headers) + " |"
+    body = [
+        "| " + " | ".join(_markdown_cell(value) for value in row) + " |"
+        for row in rows
+    ]
+    return "\n".join([header_line, separator] + body)
+
+
+def _stage1_report_markdown(dashboard):
+    slate = dashboard.get("slateRead", {})
+    lines = [
+        "Slate Read",
+        "",
+        f"{dashboard.get('title')} - {dashboard.get('subtitle')}",
+        "",
+        _markdown_table(
+            ["Field", "Value"],
+            [
+                ["Date", slate.get("date")],
+                ["Games Returned", slate.get("gamesReturned")],
+                ["Pitchers Screened", slate.get("pitchersScreened")],
+                ["Pitcher-K Odds Reviewed", slate.get("pitcherKOddsReviewed")],
+                ["Lineup Status", slate.get("lineupStatus")],
+                [
+                    "Unmatched Requested Matchups",
+                    ", ".join(slate.get("unmatchedRequestedMatchups") or []) or "None",
+                ],
+            ],
+        ),
+    ]
+
+    unavailable = dashboard.get("unavailablePitchers") or []
+    if unavailable:
+        lines.extend(
+            [
+                "",
+                "Unavailable Pitchers",
+                "",
+                _markdown_table(
+                    ["Matchup", "Team", "Pitcher", "Reason"],
+                    [
+                        [
+                            item.get("matchup"),
+                            item.get("team"),
+                            item.get("pitcher"),
+                            item.get("reason"),
+                        ]
+                        for item in unavailable
+                    ],
+                ),
+            ]
+        )
+
+    lines.extend(["", "rankGapNotes", ""])
+    lines.append(
+        _markdown_table(
+            ["#", "Note"],
+            [
+                [index, note]
+                for index, note in enumerate(dashboard.get("rankGapNotes") or [], start=1)
+            ],
+        )
+    )
+
+    for table_key in ("research", "borderline", "passForNow"):
+        table = dashboard.get("tables", {}).get(table_key, {})
+        columns = table.get("displayColumns") or []
+        rows = table.get("rows") or []
+        headers = [column.get("label") for column in columns]
+        keys = [column.get("key") for column in columns]
+        lines.extend(["", table.get("title", table_key), ""])
+        lines.append(
+            _markdown_table(
+                headers,
+                [[row.get(key) for key in keys] for row in rows],
+            )
+        )
+
+    lines.extend(["", "What I Need Next", ""])
+    for item in dashboard.get("whatINeedNext") or []:
+        lines.append(item)
+
+    return "\n".join(lines)
 
 
 def _compact_game(game):
@@ -1551,6 +1648,7 @@ def game_screening():
         "screeningOnly": True,
         "responseMode": "compact",
         "stage1Dashboard": stage1_dashboard,
+        "stage1ReportMarkdown": stage1_dashboard.get("stage1ReportMarkdown"),
         "requestedMatchups": [
             f"{away}@{home}" for away, home in requested
         ],
@@ -1564,6 +1662,7 @@ def game_screening():
         "notes": [
             "This compact response is designed to fit a full screenshot slate in one action call.",
             "Use stage1Dashboard for the user-facing Stage 1 report.",
+            "Use stage1ReportMarkdown exactly when the GPT needs a consistent ready-made Stage 1 report.",
             "This endpoint screens games for deeper pitcher-K research. It does not recommend bets.",
             "Expected Ks is the preferred Stage 1 ranking field; the old research-priority score remains as a comparison aid.",
             "Recommended pitchers come from the RESEARCH group, up to a maximum of 10.",
