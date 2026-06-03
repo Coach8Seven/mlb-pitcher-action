@@ -621,17 +621,21 @@ def _requested_matchups(raw):
 def _format_screening_game(game, season):
     away = game.get("teams", {}).get("away", {})
     home = game.get("teams", {}).get("home", {})
+    away_code = _normalize_team_code(away.get("team", {}).get("abbreviation"))
+    home_code = _normalize_team_code(home.get("team", {}).get("abbreviation"))
     sides = [("away", away, home), ("home", home, away)]
     pitchers = []
 
     for side, team_side, opponent_side in sides:
+        team_code = _normalize_team_code(team_side.get("team", {}).get("abbreviation"))
+        opponent_code = _normalize_team_code(opponent_side.get("team", {}).get("abbreviation"))
         probable = team_side.get("probablePitcher")
         if not probable:
             pitchers.append(
                 {
                     "side": side,
-                    "team": team_side.get("team", {}).get("abbreviation"),
-                    "opponent": opponent_side.get("team", {}).get("abbreviation"),
+                    "team": team_code,
+                    "opponent": opponent_code,
                     "available": False,
                     "reason": "Probable starter is not listed yet.",
                 }
@@ -647,8 +651,8 @@ def _format_screening_game(game, season):
             profile.update(
                 {
                     "side": side,
-                    "team": team_side.get("team", {}).get("abbreviation"),
-                    "opponent": opponent_side.get("team", {}).get("abbreviation"),
+                    "team": team_code,
+                    "opponent": opponent_code,
                     "available": True,
                 }
             )
@@ -657,8 +661,8 @@ def _format_screening_game(game, season):
             pitchers.append(
                 {
                     "side": side,
-                    "team": team_side.get("team", {}).get("abbreviation"),
-                    "opponent": opponent_side.get("team", {}).get("abbreviation"),
+                    "team": team_code,
+                    "opponent": opponent_code,
                     "id": probable.get("id"),
                     "name": probable.get("fullName"),
                     "available": False,
@@ -675,10 +679,7 @@ def _format_screening_game(game, season):
         "gamePk": game.get("gamePk"),
         "gameDate": game.get("gameDate"),
         "status": game.get("status", {}).get("detailedState"),
-        "matchup": (
-            f"{away.get('team', {}).get('abbreviation')}"
-            f"@{home.get('team', {}).get('abbreviation')}"
-        ),
+        "matchup": f"{away_code}@{home_code}",
         "awayTeam": away.get("team", {}).get("name"),
         "homeTeam": home.get("team", {}).get("name"),
         "venue": game.get("venue", {}).get("name"),
@@ -1044,6 +1045,115 @@ def _legacy_pitcher_summary(pitcher):
     }
 
 
+def _format_rate(value):
+    return f"{round(value * 100, 1)}%" if value is not None else "N/A"
+
+
+def _format_pp(value):
+    if value is None:
+        return "N/A"
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{round(value * 100, 1)} pp"
+
+
+def _format_number(value, digits=1):
+    return f"{round(value, digits):.{digits}f}" if value is not None else "N/A"
+
+
+def _dashboard_row(pitcher):
+    return {
+        "rank": pitcher.get("rank"),
+        "pitcher": pitcher.get("pitcher"),
+        "matchup": pitcher.get("matchup"),
+        "hand": pitcher.get("throws") or "N/A",
+        "baseK": _format_rate(pitcher.get("baseKRate")),
+        "matchupAdj": _format_pp(pitcher.get("opponentMatchupAdjustment")),
+        "estK": _format_rate(pitcher.get("estimatedKRate")),
+        "expBF": _format_number(pitcher.get("expectedBattersFaced")),
+        "expKs": _format_number(pitcher.get("expectedStrikeouts")),
+        "range": pitcher.get("expectedStrikeoutRange") or "N/A",
+        "confidence": pitcher.get("confidence") or "N/A",
+        "gapNote": pitcher.get("expectedKGapLabel") or "top rank",
+        "whyConcern": pitcher.get("groupReason") or "N/A",
+    }
+
+
+def _unavailable_pitchers(compact_games):
+    unavailable = []
+    for game in compact_games:
+        for pitcher in game.get("pitchers", []):
+            if pitcher.get("available"):
+                continue
+            unavailable.append(
+                {
+                    "matchup": game.get("matchup"),
+                    "team": pitcher.get("team"),
+                    "pitcher": pitcher.get("pitcher") or "Not listed",
+                    "reason": pitcher.get("reason") or "Unavailable",
+                }
+            )
+    return unavailable
+
+
+def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups, rank_gap_notes):
+    research_rows = [_dashboard_row(pitcher) for pitcher in compact_groups.get("research", [])]
+    borderline_rows = [_dashboard_row(pitcher) for pitcher in compact_groups.get("borderline", [])]
+    pass_rows = [_dashboard_row(pitcher) for pitcher in compact_groups.get("passForNow", [])]
+    pitchers_screened = len(research_rows) + len(borderline_rows) + len(pass_rows)
+    research_names = [row["pitcher"] for row in research_rows]
+    what_next = [
+        "No bets yet.",
+        "Approve the RESEARCH group before Stage 2.",
+        "Send Bet365 pitcher-K screenshots for the RESEARCH group first.",
+    ]
+    if research_names:
+        what_next.extend(
+            f"{index}. {name}"
+            for index, name in enumerate(research_names, start=1)
+        )
+    else:
+        what_next.append("No RESEARCH pitchers cleared the screen. Consider No Bet Day or ask about BORDERLINE soft-line checks.")
+    if borderline_rows:
+        what_next.append("Optional: include BORDERLINE pitchers only if you want to check for unusually soft Bet365 lines.")
+
+    return {
+        "title": "MLB Pitcher-K Screen",
+        "subtitle": "Research only. No bets yet.",
+        "slateRead": {
+            "date": date,
+            "requestedMatchups": [f"{away}@{home}" for away, home in requested],
+            "unmatchedRequestedMatchups": unmatched,
+            "gamesReturned": len(compact_games),
+            "pitchersScreened": pitchers_screened,
+            "lineupStatus": "Unavailable from helper unless user/browser confirms projected or confirmed lineups.",
+            "pitcherKOddsReviewed": "No",
+        },
+        "rankGapNotes": rank_gap_notes,
+        "tables": {
+            "research": {
+                "title": "RESEARCH",
+                "rows": research_rows,
+            },
+            "borderline": {
+                "title": "BORDERLINE",
+                "rows": borderline_rows,
+            },
+            "passForNow": {
+                "title": "PASS FOR NOW",
+                "rows": pass_rows,
+            },
+        },
+        "unavailablePitchers": _unavailable_pitchers(compact_games),
+        "whatINeedNext": what_next,
+        "displayRules": [
+            "Use these rows in the returned order.",
+            "Copy confidence, matchup, gapNote, and whyConcern exactly.",
+            "Do not rename teams, reorder rows, upgrade confidence, or rewrite group reasons.",
+            "High+ is research priority only, not a bet.",
+        ],
+    }
+
+
 def _compact_game(game):
     pitchers = []
     for pitcher in game.get("pitchers", []):
@@ -1406,12 +1516,21 @@ def game_screening():
             + compact_groups.get("passForNow", [])
         )
     ]
+    stage1_dashboard = _stage1_dashboard(
+        date,
+        requested,
+        unmatched,
+        compact_games,
+        compact_groups,
+        rank_gap_notes,
+    )
 
     payload = {
         "date": date,
         "season": season,
         "screeningOnly": True,
         "responseMode": "compact",
+        "stage1Dashboard": stage1_dashboard,
         "requestedMatchups": [
             f"{away}@{home}" for away, home in requested
         ],
@@ -1424,6 +1543,7 @@ def game_screening():
         "rankGapNotes": rank_gap_notes,
         "notes": [
             "This compact response is designed to fit a full screenshot slate in one action call.",
+            "Use stage1Dashboard for the user-facing Stage 1 report.",
             "This endpoint screens games for deeper pitcher-K research. It does not recommend bets.",
             "Expected Ks is the preferred Stage 1 ranking field; the old research-priority score remains as a comparison aid.",
             "Recommended pitchers come from the RESEARCH group, up to a maximum of 10.",
