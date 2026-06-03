@@ -1123,15 +1123,22 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
         "Approve the RESEARCH group before Stage 2.",
         "Send Bet365 pitcher-K screenshots for the RESEARCH group first.",
     ]
-    if research_names:
-        what_next.extend(
-            f"{index}. {name}"
-            for index, name in enumerate(research_names, start=1)
-        )
-    else:
+    stage2_targets = [
+        {
+            "rank": row.get("rank"),
+            "pitcher": row.get("pitcher"),
+            "team": row.get("team"),
+            "matchup": row.get("matchup"),
+        }
+        for row in research_rows
+    ]
+    if not research_names:
         what_next.append("No RESEARCH pitchers cleared the screen. Consider No Bet Day or ask about BORDERLINE soft-line checks.")
-    if borderline_rows:
-        what_next.append("Optional: include BORDERLINE pitchers only if you want to check for unusually soft Bet365 lines.")
+    borderline_option = (
+        "Optional: include BORDERLINE pitchers only if you want to check for unusually soft Bet365 lines."
+        if borderline_rows
+        else None
+    )
 
     dashboard = {
         "title": "MLB Pitcher-K Screen",
@@ -1164,6 +1171,8 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
             },
         },
         "unavailablePitchers": _unavailable_pitchers(compact_games),
+        "stage2ScreenshotTargets": stage2_targets,
+        "borderlineOption": borderline_option,
         "whatINeedNext": what_next,
         "displayRules": [
             "Use this section order: Slate Read, rankGapNotes, RESEARCH, BORDERLINE, PASS FOR NOW, What I Need Next.",
@@ -1267,6 +1276,29 @@ def _stage1_report_markdown(dashboard):
     lines.extend(["", "What I Need Next", ""])
     for item in dashboard.get("whatINeedNext") or []:
         lines.append(item)
+    targets = dashboard.get("stage2ScreenshotTargets") or []
+    if targets:
+        lines.extend(
+            [
+                "",
+                "Stage 2 Screenshot Targets",
+                "",
+                _markdown_table(
+                    ["Rank", "Pitcher", "Team", "Matchup"],
+                    [
+                        [
+                            target.get("rank"),
+                            target.get("pitcher"),
+                            target.get("team"),
+                            target.get("matchup"),
+                        ]
+                        for target in targets
+                    ],
+                ),
+            ]
+        )
+    if dashboard.get("borderlineOption"):
+        lines.extend(["", dashboard["borderlineOption"]])
 
     return "\n".join(lines)
 
