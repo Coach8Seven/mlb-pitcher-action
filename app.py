@@ -1101,6 +1101,21 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
     pass_rows = [_dashboard_row(pitcher) for pitcher in compact_groups.get("passForNow", [])]
     pitchers_screened = len(research_rows) + len(borderline_rows) + len(pass_rows)
     research_names = [row["pitcher"] for row in research_rows]
+    display_columns = [
+        {"key": "rank", "label": "Rank"},
+        {"key": "pitcher", "label": "Pitcher"},
+        {"key": "matchup", "label": "Matchup"},
+        {"key": "hand", "label": "Hand"},
+        {"key": "baseK", "label": "Base K%"},
+        {"key": "matchupAdj", "label": "Matchup Adj"},
+        {"key": "estK", "label": "Est K%"},
+        {"key": "expBF", "label": "Exp BF"},
+        {"key": "expKs", "label": "Exp Ks"},
+        {"key": "range", "label": "Range"},
+        {"key": "confidence", "label": "Confidence"},
+        {"key": "gapNote", "label": "Gap Note"},
+        {"key": "whyConcern", "label": "Why / Concern"},
+    ]
     what_next = [
         "No bets yet.",
         "Approve the RESEARCH group before Stage 2.",
@@ -1132,21 +1147,26 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
         "tables": {
             "research": {
                 "title": "RESEARCH",
+                "displayColumns": display_columns,
                 "rows": research_rows,
             },
             "borderline": {
                 "title": "BORDERLINE",
+                "displayColumns": display_columns,
                 "rows": borderline_rows,
             },
             "passForNow": {
                 "title": "PASS FOR NOW",
+                "displayColumns": display_columns,
                 "rows": pass_rows,
             },
         },
         "unavailablePitchers": _unavailable_pitchers(compact_games),
         "whatINeedNext": what_next,
         "displayRules": [
+            "Use this section order: Slate Read, rankGapNotes, RESEARCH, BORDERLINE, PASS FOR NOW, What I Need Next.",
             "Use these rows in the returned order.",
+            "Use every displayColumns entry for each table, in the returned order.",
             "Copy confidence, matchup, gapNote, and whyConcern exactly.",
             "Do not rename teams, reorder rows, upgrade confidence, or rewrite group reasons.",
             "High+ is research priority only, not a bet.",
