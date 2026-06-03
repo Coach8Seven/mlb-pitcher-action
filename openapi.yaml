@@ -1,16 +1,16 @@
 openapi: 3.1.0
 info:
   title: MLB Pitcher Strikeout Helper
-  description: Screens MLB games for pitcher-strikeout research and returns detailed recent pitcher starts with pitch mix and velocity trend.
-  version: 1.2.0
+  description: Screens MLB pitcher-K candidates with expected Ks, groups, and recent starts with pitch mix and velocity trend.
+  version: 1.3.0
 servers:
   - url: https://coach8seven-mlb-pitcher-action.onrender.com
 paths:
   /game-screening:
     get:
       operationId: screenMlbGames
-      summary: Screen screenshot-provided MLB games for deeper pitcher-strikeout research.
-      description: Use this action after the user sends Bet365 game screenshots. Pass only the visible screenshot-provided matchups. This endpoint ranks games for deeper research using probable starters, throwing hand, pitcher K rate, opponent strikeout rate versus handedness, and recent workload. It does not recommend bets.
+      summary: Screen screenshot-provided MLB games for pitcher-K research.
+      description: Use after Bet365 game screenshots. Pass only visible matchups. Returns all screened pitchers grouped as research, borderline, or pass using expected Ks, expected BF, K profile, matchup, workload, and gap notes. No bets.
       parameters:
         - name: date
           in: query
@@ -26,7 +26,7 @@ paths:
             type: string
       responses:
         "200":
-          description: Ranked game-screening results for deeper pitcher-K research. Scores are screening aids, not bet recommendations.
+          description: Ranked pitcher-screening results for deeper pitcher-K research. Scores are screening aids, not bet recommendations.
           content:
             application/json:
               schema:
@@ -46,6 +46,20 @@ paths:
                     type: array
                     items:
                       type: object
+                  recommendedPitchers:
+                    type: array
+                    items:
+                      type: object
+                  notSelectedPitchers:
+                    type: array
+                    items:
+                      type: object
+                  screeningGroups:
+                    type: object
+                  rankGapNotes:
+                    type: array
+                    items:
+                      type: string
   /pitcher-last-starts:
     get:
       operationId: getPitcherLastStarts
