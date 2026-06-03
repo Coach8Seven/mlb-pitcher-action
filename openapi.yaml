@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: MLB Pitcher Strikeout Helper
   description: Screens MLB pitcher-K candidates with expected Ks, groups, and recent starts with pitch mix and velocity trend.
-  version: 1.4.0
+  version: 1.5.0
 servers:
   - url: https://coach8seven-mlb-pitcher-action.onrender.com
 paths:
@@ -10,7 +10,7 @@ paths:
     get:
       operationId: screenMlbGames
       summary: Screen screenshot-provided MLB games for pitcher-K research.
-      description: Use after Bet365 game screenshots. Pass only visible matchups. Returns a ready Stage 1 dashboard plus compact grouped pitcher rows. No bets.
+      description: Use after Bet365 game screenshots. Pass only visible matchups. Returns ready Stage 1 report markdown plus dashboard rows. No bets.
       parameters:
         - name: date
           in: query
@@ -44,6 +44,8 @@ paths:
                       type: string
                   stage1Dashboard:
                     type: object
+                  stage1ReportMarkdown:
+                    type: string
                   games:
                     type: array
                     items:
