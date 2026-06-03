@@ -991,6 +991,101 @@ def _rank_screening_pitchers(games, limit=10, minimum_score=45):
     return recommended, not_selected, screening_groups, _rank_gap_notes(ranked)
 
 
+def _compact_pitcher(pitcher):
+    return {
+        "rank": pitcher.get("groupRank"),
+        "overallRank": pitcher.get("researchRank") or pitcher.get("screenRank"),
+        "pitcherId": pitcher.get("pitcherId"),
+        "pitcher": pitcher.get("pitcher"),
+        "matchup": pitcher.get("matchup"),
+        "team": pitcher.get("team"),
+        "opponent": pitcher.get("opponent"),
+        "throws": pitcher.get("throws"),
+        "baseKRate": pitcher.get("baseKRate"),
+        "opponentKRateVsHand": pitcher.get("opponentKRateVsHand"),
+        "opponentMatchupAdjustment": pitcher.get("opponentMatchupAdjustment"),
+        "recentFormAdjustment": pitcher.get("recentFormAdjustment"),
+        "estimatedKRate": pitcher.get("estimatedKRate"),
+        "expectedBattersFaced": pitcher.get("expectedBattersFaced"),
+        "expectedStrikeouts": pitcher.get("expectedStrikeouts"),
+        "expectedStrikeoutRange": pitcher.get("expectedStrikeoutRange"),
+        "confidence": pitcher.get("confidence"),
+        "stage1Group": pitcher.get("stage1Group"),
+        "expectedKGapFromPrevious": pitcher.get("expectedKGapFromPrevious"),
+        "expectedKGapLabel": pitcher.get("expectedKGapLabel"),
+        "groupReason": pitcher.get("groupReason"),
+        "lineupStatus": pitcher.get("lineupStatus"),
+        "recentLast5AverageKs": pitcher.get("recentLast5AverageKs"),
+        "recentLast5AveragePitches": pitcher.get("recentLast5AveragePitches"),
+        "recentLast5AverageBattersFaced": pitcher.get("recentLast5AverageBattersFaced"),
+        "recentLast10AverageKs": pitcher.get("recentLast10AverageKs"),
+        "recentLast10AveragePitches": pitcher.get("recentLast10AveragePitches"),
+        "recentLast10AverageBattersFaced": pitcher.get("recentLast10AverageBattersFaced"),
+        "researchPriorityScore": pitcher.get("researchPriorityScore"),
+    }
+
+
+def _compact_groups(screening_groups):
+    return {
+        group: [_compact_pitcher(pitcher) for pitcher in pitchers]
+        for group, pitchers in screening_groups.items()
+    }
+
+
+def _legacy_pitcher_summary(pitcher):
+    return {
+        "rank": pitcher.get("rank"),
+        "pitcher": pitcher.get("pitcher"),
+        "matchup": pitcher.get("matchup"),
+        "stage1Group": pitcher.get("stage1Group"),
+        "expectedStrikeouts": pitcher.get("expectedStrikeouts"),
+        "confidence": pitcher.get("confidence"),
+        "groupReason": pitcher.get("groupReason"),
+    }
+
+
+def _compact_game(game):
+    pitchers = []
+    for pitcher in game.get("pitchers", []):
+        if pitcher.get("available"):
+            model = pitcher.get("expectedKModel", {})
+            pitchers.append(
+                {
+                    "pitcherId": pitcher.get("id"),
+                    "pitcher": pitcher.get("name"),
+                    "team": pitcher.get("team"),
+                    "opponent": pitcher.get("opponent"),
+                    "throws": pitcher.get("throws"),
+                    "available": True,
+                    "expectedStrikeouts": model.get("expectedStrikeouts"),
+                    "stage1Confidence": model.get("confidence", {}).get("label"),
+                    "researchPriorityScore": pitcher.get("researchPriorityScore"),
+                }
+            )
+        else:
+            pitchers.append(
+                {
+                    "pitcherId": pitcher.get("id"),
+                    "pitcher": pitcher.get("name"),
+                    "team": pitcher.get("team"),
+                    "opponent": pitcher.get("opponent"),
+                    "available": False,
+                    "reason": pitcher.get("reason"),
+                }
+            )
+
+    return {
+        "gamePk": game.get("gamePk"),
+        "gameDate": game.get("gameDate"),
+        "status": game.get("status"),
+        "matchup": game.get("matchup"),
+        "awayTeam": game.get("awayTeam"),
+        "homeTeam": game.get("homeTeam"),
+        "venue": game.get("venue"),
+        "pitchers": pitchers,
+    }
+
+
 def _is_whiff(event):
     call = (event.get("details") or {}).get("call") or {}
     code = str(call.get("code") or (event.get("details") or {}).get("code") or "")
@@ -1245,6 +1340,11 @@ def health():
 def game_screening():
     date = request.args.get("date") or datetime.now().strftime("%Y-%m-%d")
     season = request.args.get("season") or date[:4]
+    include_details = str(request.args.get("include_details", "false")).lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     requested = _requested_matchups(request.args.get("matchups"))
     games = _schedule(date)
 
@@ -1293,35 +1393,56 @@ def game_screening():
         screening_groups,
         rank_gap_notes,
     ) = _rank_screening_pitchers(screened)
+    compact_groups = _compact_groups(screening_groups)
+    compact_games = [_compact_game(game) for game in screened]
+    compact_recommended = [
+        _legacy_pitcher_summary(pitcher)
+        for pitcher in compact_groups.get("research", [])
+    ]
+    compact_not_selected = [
+        _legacy_pitcher_summary(pitcher)
+        for pitcher in (
+            compact_groups.get("borderline", [])
+            + compact_groups.get("passForNow", [])
+        )
+    ]
 
-    return jsonify(
-        {
-            "date": date,
-            "season": season,
-            "screeningOnly": True,
-            "requestedMatchups": [
-                f"{away}@{home}" for away, home in requested
-            ],
-            "unmatchedRequestedMatchups": unmatched,
-            "gamesReturned": len(screened),
-            "games": screened,
-            "recommendedPitchers": recommended_pitchers,
-            "notSelectedPitchers": not_selected_pitchers,
-            "screeningGroups": screening_groups,
-            "rankGapNotes": rank_gap_notes,
-            "notes": [
-                "This endpoint screens games for deeper pitcher-K research. It does not recommend bets.",
-                "Expected Ks is the preferred Stage 1 ranking field; the old research-priority score remains as a comparison aid.",
-                "Recommended pitchers come from the RESEARCH group, up to a maximum of 10.",
-                "Every screened pitcher is also returned in screeningGroups: research, borderline, or passForNow.",
-                "Expected-K gap guide: under 0.30 = tied; 0.30-0.59 = small edge; 0.60-0.99 = meaningful edge; 1.00+ = major edge.",
-                "Use measurable screening data only. Reputation or name value is not a reason to research a pitcher.",
-                "Send only screenshot-provided matchups in the matchups query when screening a Bet365 screenshot.",
-                "Projected lineups can support research with an uncertainty haircut, but never treat projected lineups as confirmed.",
-                "Confirm lineups, injury news, weather, Bet365 pitcher-K lines, and prices before any final bet decision.",
-            ],
-        }
-    )
+    payload = {
+        "date": date,
+        "season": season,
+        "screeningOnly": True,
+        "responseMode": "compact",
+        "requestedMatchups": [
+            f"{away}@{home}" for away, home in requested
+        ],
+        "unmatchedRequestedMatchups": unmatched,
+        "gamesReturned": len(screened),
+        "games": compact_games,
+        "recommendedPitchers": compact_recommended,
+        "notSelectedPitchers": compact_not_selected,
+        "screeningGroups": compact_groups,
+        "rankGapNotes": rank_gap_notes,
+        "notes": [
+            "This compact response is designed to fit a full screenshot slate in one action call.",
+            "This endpoint screens games for deeper pitcher-K research. It does not recommend bets.",
+            "Expected Ks is the preferred Stage 1 ranking field; the old research-priority score remains as a comparison aid.",
+            "Recommended pitchers come from the RESEARCH group, up to a maximum of 10.",
+            "Every screened pitcher is returned in screeningGroups: research, borderline, or passForNow.",
+            "Expected-K gap guide: under 0.30 = tied; 0.30-0.59 = small edge; 0.60-0.99 = meaningful edge; 1.00+ = major edge.",
+            "Use measurable screening data only. Reputation or name value is not a reason to research a pitcher.",
+            "Send only screenshot-provided matchups in the matchups query when screening a Bet365 screenshot.",
+            "Projected lineups can support research with an uncertainty haircut, but never treat projected lineups as confirmed.",
+            "Confirm lineups, injury news, weather, Bet365 pitcher-K lines, and prices before any final bet decision.",
+        ],
+    }
+    if include_details:
+        payload["responseMode"] = "detailed"
+        payload["debugFullGames"] = screened
+        payload["debugFullScreeningGroups"] = screening_groups
+        payload["debugFullRecommendedPitchers"] = recommended_pitchers
+        payload["debugFullNotSelectedPitchers"] = not_selected_pitchers
+
+    return jsonify(payload)
 
 
 @app.get("/pitcher-last-starts")
