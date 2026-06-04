@@ -1,7 +1,8 @@
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from math import ceil, floor, sqrt
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify, request
@@ -9,6 +10,7 @@ from flask import Flask, jsonify, request
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
+ATLANTIC_TZ = ZoneInfo("America/Moncton")
 
 app = Flask(__name__)
 
@@ -17,6 +19,20 @@ def _get_json(url, params=None):
     response = requests.get(url, params=params, timeout=20)
     response.raise_for_status()
     return response.json()
+
+
+def _format_game_time(game_date):
+    if not game_date:
+        return "N/A"
+    try:
+        parsed = datetime.fromisoformat(str(game_date).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        local = parsed.astimezone(ATLANTIC_TZ)
+    except ValueError:
+        return str(game_date)
+    hour = local.strftime("%I").lstrip("0") or "12"
+    return f"{hour}:{local.strftime('%M')} {local.strftime('%p')} Atlantic"
 
 
 def _num(value, default=0):
@@ -690,6 +706,7 @@ def _format_screening_game(game, season):
     return {
         "gamePk": game.get("gamePk"),
         "gameDate": game.get("gameDate"),
+        "gameTime": _format_game_time(game.get("gameDate")),
         "status": game.get("status", {}).get("detailedState"),
         "matchup": f"{away_code}@{home_code}",
         "awayTeam": away.get("team", {}).get("name"),
@@ -897,6 +914,7 @@ def _rank_screening_pitchers(games, limit=10, minimum_score=45):
                 "opponent": pitcher.get("opponent"),
                 "matchup": game.get("matchup"),
                 "gameDate": game.get("gameDate"),
+                "gameTime": game.get("gameTime"),
                 "venue": game.get("venue"),
                 "throws": pitcher.get("throws"),
                 "researchPriorityScore": score,
@@ -1011,6 +1029,7 @@ def _compact_pitcher(pitcher):
         "pitcherId": pitcher.get("pitcherId"),
         "pitcher": pitcher.get("pitcher"),
         "matchup": pitcher.get("matchup"),
+        "gameTime": pitcher.get("gameTime"),
         "team": pitcher.get("team"),
         "opponent": pitcher.get("opponent"),
         "throws": pitcher.get("throws"),
@@ -1078,6 +1097,7 @@ def _dashboard_row(pitcher):
         "pitcher": pitcher.get("pitcher"),
         "team": pitcher.get("team") or "N/A",
         "matchup": pitcher.get("matchup"),
+        "gameTime": pitcher.get("gameTime") or "N/A",
         "hand": pitcher.get("throws") or "N/A",
         "baseK": _format_rate(pitcher.get("baseKRate")),
         "matchupAdj": _format_pp(pitcher.get("opponentMatchupAdjustment")),
@@ -1100,6 +1120,7 @@ def _unavailable_pitchers(compact_games):
             unavailable.append(
                 {
                     "matchup": game.get("matchup"),
+                    "gameTime": game.get("gameTime"),
                     "team": pitcher.get("team"),
                     "pitcher": pitcher.get("pitcher") or "Not listed",
                     "reason": pitcher.get("reason") or "Unavailable",
@@ -1119,6 +1140,7 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
         {"key": "pitcher", "label": "Pitcher"},
         {"key": "team", "label": "Team"},
         {"key": "matchup", "label": "Matchup"},
+        {"key": "gameTime", "label": "Game Time"},
         {"key": "hand", "label": "Hand"},
         {"key": "baseK", "label": "Base K%"},
         {"key": "matchupAdj", "label": "Matchup Adj"},
@@ -1141,6 +1163,7 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
             "pitcher": row.get("pitcher"),
             "team": row.get("team"),
             "matchup": row.get("matchup"),
+            "gameTime": row.get("gameTime"),
         }
         for row in research_rows
     ]
@@ -1246,10 +1269,11 @@ def _stage1_report_markdown(dashboard):
                 "Unavailable Pitchers",
                 "",
                 _markdown_table(
-                    ["Matchup", "Team", "Pitcher", "Reason"],
+                    ["Matchup", "Game Time", "Team", "Pitcher", "Reason"],
                     [
                         [
                             item.get("matchup"),
+                            item.get("gameTime"),
                             item.get("team"),
                             item.get("pitcher"),
                             item.get("reason"),
@@ -1296,13 +1320,14 @@ def _stage1_report_markdown(dashboard):
                 "Stage 2 Screenshot Targets",
                 "",
                 _markdown_table(
-                    ["Rank", "Pitcher", "Team", "Matchup"],
+                    ["Rank", "Pitcher", "Team", "Matchup", "Game Time"],
                     [
                         [
                             target.get("rank"),
                             target.get("pitcher"),
                             target.get("team"),
                             target.get("matchup"),
+                            target.get("gameTime"),
                         ]
                         for target in targets
                     ],
@@ -1627,10 +1652,13 @@ def _stage2_decision(candidate, expected_ks, summary):
 
 
 def _stage2_candidate_profile(candidate, season, games_by_matchup, date, include_pitch_quality=True):
+    game = games_by_matchup.get(candidate.get("matchup"))
+    game_time = _format_game_time(game.get("gameDate")) if game else "N/A"
     pitcher = _find_pitcher(candidate["pitcher"])
     if not pitcher:
         return {
             "candidate": candidate,
+            "gameTime": game_time,
             "error": f"No pitcher found for {candidate['pitcher']}.",
         }
     opponent_team_id = _opponent_team_id_for_candidate(candidate, games_by_matchup)
@@ -1667,6 +1695,7 @@ def _stage2_candidate_profile(candidate, season, games_by_matchup, date, include
         "pitcher": pitcher.get("fullName") or candidate["pitcher"],
         "team": candidate.get("team"),
         "matchup": candidate.get("matchup"),
+        "gameTime": game_time,
         "line": candidate.get("line"),
         "overOdds": candidate.get("overOdds"),
         "underOdds": candidate.get("underOdds"),
@@ -1693,6 +1722,7 @@ def _stage2_line_read_row(profile):
         profile.get("pitcher") or candidate.get("pitcher"),
         candidate.get("team"),
         candidate.get("matchup"),
+        profile.get("gameTime") or "N/A",
         _line(candidate.get("line")),
         _decimal(candidate.get("overOdds")),
         _decimal(candidate.get("underOdds")),
@@ -1708,6 +1738,7 @@ def _stage2_side_row(profile):
         profile.get("pitcher"),
         profile.get("team"),
         profile.get("matchup"),
+        profile.get("gameTime") or "N/A",
         _line(profile.get("line")),
         _format_number(profile.get("expectedStrikeouts")),
         _format_number(profile.get("gapVsLine")),
@@ -1728,8 +1759,10 @@ def _stage2_pitch_quality_row(profile):
             profile.get("pitcher"),
             profile.get("team"),
             profile.get("matchup"),
+            profile.get("gameTime") or "N/A",
             "Unavailable",
             "Unavailable",
+            "N/A",
             "N/A",
             "N/A",
             "N/A",
@@ -1742,6 +1775,7 @@ def _stage2_pitch_quality_row(profile):
         profile.get("pitcher"),
         profile.get("team"),
         profile.get("matchup"),
+        profile.get("gameTime") or "N/A",
         _pitch_name(quality.get("mainPitch")),
         _pitch_name(whiff_pitch),
         _format_rate(whiff_pitch.get("sampleWhiffRate")),
@@ -1759,6 +1793,7 @@ def _stage2_compact_profile(profile):
             "pitcher": candidate.get("pitcher"),
             "team": candidate.get("team"),
             "matchup": candidate.get("matchup"),
+            "gameTime": profile.get("gameTime") or "N/A",
             "error": profile.get("error"),
         }
 
@@ -1769,6 +1804,7 @@ def _stage2_compact_profile(profile):
         "pitcher": profile.get("pitcher"),
         "team": profile.get("team"),
         "matchup": profile.get("matchup"),
+        "gameTime": profile.get("gameTime"),
         "line": profile.get("line"),
         "overOdds": profile.get("overOdds"),
         "underOdds": profile.get("underOdds"),
@@ -1859,7 +1895,7 @@ def _stage2_report_markdown(date, profiles, parse_errors):
         "Bet365 Lines Read",
         "",
         _markdown_table(
-            ["Pitcher", "Team", "Matchup", "Line", "Over Odds", "Under Odds", "Read Status"],
+            ["Pitcher", "Team", "Matchup", "Game Time", "Line", "Over Odds", "Under Odds", "Read Status"],
             [_stage2_line_read_row(profile) for profile in profiles],
         ),
     ]
@@ -1890,6 +1926,7 @@ def _stage2_report_markdown(date, profiles, parse_errors):
                     "Pitcher",
                     "Team",
                     "Matchup",
+                    "Game Time",
                     "Line",
                     "Exp Ks",
                     "Gap vs Line",
@@ -1911,6 +1948,7 @@ def _stage2_report_markdown(date, profiles, parse_errors):
                     "Pitcher",
                     "Team",
                     "Matchup",
+                    "Game Time",
                     "Main Pitch",
                     "Best Whiff Pitch",
                     "Whiff%",
@@ -1936,12 +1974,13 @@ def _stage2_report_markdown(date, profiles, parse_errors):
             continue
         lines.append(
             _markdown_table(
-                ["Pitcher", "Team", "Matchup", "Line", "Best Side", "Status", "Reason"],
+                ["Pitcher", "Team", "Matchup", "Game Time", "Line", "Best Side", "Status", "Reason"],
                 [
                     [
                         profile.get("pitcher"),
                         profile.get("team"),
                         profile.get("matchup"),
+                        profile.get("gameTime") or "N/A",
                         _line(profile.get("line")),
                         profile.get("bestSide"),
                         profile.get("status"),
@@ -1957,7 +1996,7 @@ def _stage2_report_markdown(date, profiles, parse_errors):
         lines.extend(
             [
                 "",
-                f"{profile.get('pitcher')} - {profile.get('team')} - {profile.get('matchup')}",
+                f"{profile.get('pitcher')} - {profile.get('team')} - {profile.get('matchup')} - {profile.get('gameTime') or 'N/A'}",
                 f"Line: {_line(profile.get('line'))} Ks | Best Side: {profile.get('bestSide')} | Status: {profile.get('status')}",
                 "",
                 _stage2_start_log_table(profile),
@@ -2015,6 +2054,7 @@ def _compact_game(game):
     return {
         "gamePk": game.get("gamePk"),
         "gameDate": game.get("gameDate"),
+        "gameTime": game.get("gameTime"),
         "status": game.get("status"),
         "matchup": game.get("matchup"),
         "awayTeam": game.get("awayTeam"),
