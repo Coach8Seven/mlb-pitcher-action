@@ -161,6 +161,20 @@ def _outs_to_innings(outs):
     return round(outs / 3, 1) if outs is not None else None
 
 
+def _outs_to_ip_text(outs):
+    if outs is None:
+        return "N/A"
+    whole = int(outs) // 3
+    remainder = int(outs) % 3
+    return f"{whole}.{remainder}"
+
+
+def _expected_ip_text(expected_outs):
+    if expected_outs is None:
+        return "N/A"
+    return f"{round(expected_outs / 3, 1):.1f}"
+
+
 def _first_stat(data):
     blocks = data.get("stats", [])
     if not blocks:
@@ -261,25 +275,28 @@ def _screening_score(pitcher_k_rate, opponent_k_rate, recent):
 
 
 def _workload_summary(starts):
+    outs = [_innings_to_outs(start["inningsPitched"]) for start in starts]
+    pitches = [start["pitches"] for start in starts]
+    batters_faced = [start["battersFaced"] for start in starts]
+    strikeouts = [start["strikeouts"] for start in starts]
     return {
         "startsTracked": len(starts),
-        "averageOuts": _avg(
-            [_innings_to_outs(start["inningsPitched"]) for start in starts],
-            1,
-        ),
+        "averageOuts": _avg(outs, 1),
         "averageInningsDecimal": _avg(
-            [_innings_to_outs(start["inningsPitched"]) / 3 for start in starts],
+            [out / 3 for out in outs],
             1,
         ),
-        "averagePitches": _avg([start["pitches"] for start in starts]),
-        "averageBattersFaced": _avg([start["battersFaced"] for start in starts]),
-        "averageStrikeouts": _avg([start["strikeouts"] for start in starts]),
+        "averagePitches": _avg(pitches),
+        "averageBattersFaced": _avg(batters_faced),
+        "averageStrikeouts": _avg(strikeouts),
         "strikeoutRate": _pct(
             sum(_num(start.get("strikeouts"), 0) for start in starts),
             sum(_num(start.get("battersFaced"), 0) for start in starts),
         ),
-        "battersFacedStdDev": _stddev([start["battersFaced"] for start in starts]),
-        "strikeoutsStdDev": _stddev([start["strikeouts"] for start in starts]),
+        "outsStdDev": _stddev(outs),
+        "pitchesStdDev": _stddev(pitches),
+        "battersFacedStdDev": _stddev(batters_faced),
+        "strikeoutsStdDev": _stddev(strikeouts),
         "starts": starts,
     }
 
@@ -1165,7 +1182,7 @@ def _stage1_dashboard(date, requested, unmatched, compact_games, compact_groups,
             "matchup": row.get("matchup"),
             "gameTime": row.get("gameTime"),
         }
-        for row in research_rows
+        for row in research_rows[:10]
     ]
     if not research_names:
         what_next.append("No RESEARCH pitchers cleared the screen. Consider No Bet Day or ask about BORDERLINE soft-line checks.")
@@ -1338,6 +1355,1311 @@ def _stage1_report_markdown(dashboard):
         lines.extend(["", dashboard["borderlineOption"]])
 
     return "\n".join(lines)
+
+
+def _outs_gap_label(gap):
+    if gap is None:
+        return None
+    if gap < 0.75:
+        return "basically tied"
+    if gap < 1.50:
+        return "small edge"
+    if gap < 2.50:
+        return "meaningful edge"
+    return "major edge"
+
+
+def _expected_outs_model(season, opponent_split, recent_last5, recent_last10):
+    season_starts = season.get("starts")
+    season_outs = _innings_to_outs(season.get("inningsPitched"))
+    season_outs_per_start = (
+        round(season_outs / season_starts, 1)
+        if season_outs is not None and season_starts
+        else None
+    )
+    last5_outs = recent_last5.get("averageOuts")
+    last10_outs = recent_last10.get("averageOuts")
+    base = _weighted_available(
+        [
+            (last5_outs, 0.50),
+            (last10_outs, 0.30),
+            (season_outs_per_start, 0.20),
+        ],
+        1,
+    )
+    if base is None:
+        return {
+            "expectedOuts": None,
+            "baseExpectedOuts": None,
+            "seasonOutsPerStart": season_outs_per_start,
+            "adjustments": [],
+            "notes": ["Expected outs unavailable because workload data is missing."],
+        }
+
+    adjustments = []
+    expected = base
+    last5_pitches = recent_last5.get("averagePitches")
+    last5_bf = recent_last5.get("averageBattersFaced")
+    last10_pitches = recent_last10.get("averagePitches")
+    pitches_per_out = (
+        round(last10_pitches / last10_outs, 2)
+        if last10_pitches is not None and last10_outs
+        else None
+    )
+    pitches_per_bf = (
+        round(last10_pitches / recent_last10.get("averageBattersFaced"), 2)
+        if last10_pitches is not None and recent_last10.get("averageBattersFaced")
+        else None
+    )
+
+    if last5_pitches is not None:
+        if last5_pitches >= 96:
+            adjustments.append({"reason": "high recent pitch-count leash", "value": 0.7})
+        elif last5_pitches >= 90:
+            adjustments.append({"reason": "stable recent pitch count", "value": 0.3})
+        elif last5_pitches < 80:
+            adjustments.append({"reason": "light recent pitch count", "value": -1.0})
+        elif last5_pitches < 86:
+            adjustments.append({"reason": "below-average recent pitch count", "value": -0.5})
+
+    if last5_bf is not None:
+        if last5_bf >= 25:
+            adjustments.append({"reason": "stable recent BF volume", "value": 0.4})
+        elif last5_bf < 21:
+            adjustments.append({"reason": "limited recent BF volume", "value": -0.8})
+
+    if pitches_per_out is not None:
+        if pitches_per_out <= 5.0:
+            adjustments.append({"reason": "efficient pitches per out", "value": 0.5})
+        elif pitches_per_out >= 6.2:
+            adjustments.append({"reason": "poor pitches-per-out efficiency", "value": -1.0})
+        elif pitches_per_out >= 5.8:
+            adjustments.append({"reason": "pitches-per-out drag", "value": -0.6})
+
+    if pitches_per_bf is not None:
+        if pitches_per_bf >= 4.45:
+            adjustments.append({"reason": "inefficient pitches per batter faced", "value": -0.5})
+        elif pitches_per_bf <= 3.75:
+            adjustments.append({"reason": "efficient BF conversion", "value": 0.2})
+
+    bb_rate = season.get("bbRate")
+    if bb_rate is not None:
+        if bb_rate >= 0.105:
+            adjustments.append({"reason": "high walk-rate length risk", "value": -0.9})
+        elif bb_rate >= 0.09:
+            adjustments.append({"reason": "walk-rate efficiency concern", "value": -0.5})
+        elif bb_rate <= 0.055:
+            adjustments.append({"reason": "low walk-rate length support", "value": 0.2})
+
+    opponent_ops = opponent_split.get("ops")
+    opponent_obp = opponent_split.get("obp")
+    opponent_k = opponent_split.get("strikeoutRate")
+    if opponent_ops is not None:
+        if opponent_ops >= 0.760:
+            adjustments.append({"reason": "opponent power/on-base pressure", "value": -0.5})
+        elif opponent_ops <= 0.680:
+            adjustments.append({"reason": "lighter opponent OPS split", "value": 0.2})
+    if opponent_obp is not None and opponent_obp >= 0.335:
+        adjustments.append({"reason": "opponent OBP can run pitch count", "value": -0.3})
+    if opponent_k is not None and opponent_k >= 0.25:
+        adjustments.append({"reason": "opponent swing-and-miss helps length", "value": 0.2})
+
+    short_recent = sum(
+        1
+        for start in recent_last5.get("starts", [])
+        if _innings_to_outs(start.get("inningsPitched")) < 15
+    )
+    if short_recent >= 3:
+        adjustments.append({"reason": "three recent starts under 5 IP", "value": -1.4})
+    elif short_recent >= 2:
+        adjustments.append({"reason": "multiple recent short starts", "value": -0.8})
+
+    for adjustment in adjustments:
+        expected += adjustment["value"]
+
+    expected = round(_clamp(expected, 9, 24), 1)
+    return {
+        "expectedOuts": expected,
+        "expectedIP": _expected_ip_text(expected),
+        "baseExpectedOuts": base,
+        "seasonOutsPerStart": season_outs_per_start,
+        "pitchesPerOutLast10": pitches_per_out,
+        "pitchesPerBatterFacedLast10": pitches_per_bf,
+        "adjustments": adjustments,
+        "notes": [
+            "Base Expected Outs uses 50% last 5 outs, 30% last 10 outs, and 20% season outs/start.",
+            "Adjustments reflect pitch count, BF volume, efficiency, walk risk, opponent pressure, and recent short starts.",
+        ],
+    }
+
+
+def _outs_confidence_label(season, recent_last5, recent_last10, expected_outs):
+    points = 0.0
+    starts_tracked = recent_last10.get("startsTracked") or 0
+    last5_outs = recent_last5.get("averageOuts")
+    last5_pitches = recent_last5.get("averagePitches")
+    last5_bf = recent_last5.get("averageBattersFaced")
+    outs_stddev = recent_last10.get("outsStdDev")
+    bb_rate = season.get("bbRate")
+
+    if expected_outs is not None:
+        if expected_outs >= 18:
+            points += 1.2
+        elif expected_outs >= 16:
+            points += 0.7
+        elif expected_outs < 14:
+            points -= 1.0
+
+    if last5_outs is not None:
+        if last5_outs >= 18:
+            points += 1.2
+        elif last5_outs >= 16:
+            points += 0.7
+        elif last5_outs < 14:
+            points -= 1.0
+
+    if last5_pitches is not None:
+        if last5_pitches >= 94:
+            points += 1.0
+        elif last5_pitches >= 88:
+            points += 0.5
+        elif last5_pitches < 80:
+            points -= 1.0
+
+    if last5_bf is not None:
+        if last5_bf >= 24:
+            points += 0.6
+        elif last5_bf < 21:
+            points -= 0.7
+
+    if starts_tracked >= 8:
+        points += 0.5
+    elif starts_tracked < 5:
+        points -= 0.8
+
+    if outs_stddev is not None:
+        if outs_stddev <= 2.0:
+            points += 0.4
+        elif outs_stddev >= 4.0:
+            points -= 0.7
+
+    if bb_rate is not None and bb_rate >= 0.105:
+        points -= 0.8
+    elif bb_rate is not None and bb_rate <= 0.055:
+        points += 0.2
+
+    if points >= 3.2:
+        label = "High"
+    elif points >= 2.1:
+        label = "Medium+"
+    elif points >= 0.8:
+        label = "Medium"
+    else:
+        label = "Low"
+
+    return {
+        "label": label,
+        "score": round(points, 1),
+        "notes": [
+            "Confidence is workload confidence for outs research, not bet confidence.",
+            "High+ is applied only after ranking when a High profile separates from the board.",
+        ],
+    }
+
+
+def _pitcher_outs_screening_profile(person_id, opponent_team_id, season, before_date=None):
+    base = _pitcher_screening_profile(
+        person_id,
+        opponent_team_id,
+        season,
+        before_date=before_date,
+    )
+    season_payload = base.get("season", {})
+    recent_last5 = base.get("recentLast5", {})
+    recent_last10 = base.get("recentLast10", {})
+    opponent_split = base.get("opponentHittingSplit", {})
+    expected_model = _expected_outs_model(
+        season_payload,
+        opponent_split,
+        recent_last5,
+        recent_last10,
+    )
+    confidence = _outs_confidence_label(
+        season_payload,
+        recent_last5,
+        recent_last10,
+        expected_model.get("expectedOuts"),
+    )
+    expected_outs = expected_model.get("expectedOuts")
+    last5_pitches = recent_last5.get("averagePitches")
+    last5_outs = recent_last5.get("averageOuts")
+    last10_outs = recent_last10.get("averageOuts")
+    score = (
+        0.35 * _normalize_score(expected_outs, 12, 20)
+        + 0.20 * _normalize_score(last5_outs, 12, 20)
+        + 0.15 * _normalize_score(last10_outs, 12, 20)
+        + 0.15 * _normalize_score(last5_pitches, 75, 100)
+        + 0.15 * _normalize_score(confidence.get("score"), 0, 4)
+    )
+    base["expectedOutsModel"] = {
+        "expectedOuts": expected_outs,
+        "expectedIP": expected_model.get("expectedIP"),
+        "expectedOutsRange": _expected_outs_range(expected_outs, confidence.get("label"), recent_last10),
+        "expectedOutsModel": expected_model,
+        "confidence": confidence,
+        "lineupStatus": "Unavailable from helper",
+        "lineupConfidenceRule": "Projected lineups can support research, but projected or unavailable lineups should reduce final confidence.",
+    }
+    base["outsResearchPriorityScore"] = round(score * 100, 1)
+    base["scoreNotes"] = [
+        "Outs research-priority score is a screening aid, not a bet recommendation.",
+        "Score weights expected outs, recent outs, recent pitch count, and workload confidence.",
+        "Lineups, news, weather, outs line, and price still require later checks.",
+    ]
+    return base
+
+
+def _expected_outs_range(expected_outs, confidence_label, recent_last10):
+    if expected_outs is None:
+        return None
+    width = {
+        "Low": 4.0,
+        "Medium": 3.2,
+        "Medium+": 2.7,
+        "High": 2.3,
+        "High+": 2.0,
+    }.get(confidence_label, 3.2)
+    volatility = recent_last10.get("outsStdDev")
+    if volatility is not None and volatility >= 4.0:
+        width += 0.8
+    elif volatility is not None and volatility <= 2.0:
+        width -= 0.4
+    low = max(0, floor(expected_outs - width))
+    high = max(low, ceil(expected_outs + width))
+    return {"low": low, "high": high, "display": f"{low}-{high}"}
+
+
+def _format_out_screening_game(game, season):
+    away = game.get("teams", {}).get("away", {})
+    home = game.get("teams", {}).get("home", {})
+    away_code = _normalize_team_code(away.get("team", {}).get("abbreviation"))
+    home_code = _normalize_team_code(home.get("team", {}).get("abbreviation"))
+    official_date = game.get("officialDate") or str(game.get("gameDate") or "")[:10]
+    sides = [("away", away, home), ("home", home, away)]
+    pitchers = []
+
+    for side, team_side, opponent_side in sides:
+        team_code = _normalize_team_code(team_side.get("team", {}).get("abbreviation"))
+        opponent_code = _normalize_team_code(opponent_side.get("team", {}).get("abbreviation"))
+        probable = team_side.get("probablePitcher")
+        if not probable:
+            pitchers.append(
+                {
+                    "side": side,
+                    "team": team_code,
+                    "opponent": opponent_code,
+                    "available": False,
+                    "reason": "Probable starter is not listed yet.",
+                }
+            )
+            continue
+
+        try:
+            profile = _pitcher_outs_screening_profile(
+                probable["id"],
+                opponent_side.get("team", {}).get("id"),
+                season,
+                before_date=official_date,
+            )
+            profile.update(
+                {
+                    "side": side,
+                    "team": team_code,
+                    "opponent": opponent_code,
+                    "available": True,
+                }
+            )
+            pitchers.append(profile)
+        except requests.RequestException:
+            pitchers.append(
+                {
+                    "side": side,
+                    "team": team_code,
+                    "opponent": opponent_code,
+                    "id": probable.get("id"),
+                    "name": probable.get("fullName"),
+                    "available": False,
+                    "reason": "MLB Stats API outs-screening data unavailable.",
+                }
+            )
+
+    available_scores = [
+        pitcher["outsResearchPriorityScore"]
+        for pitcher in pitchers
+        if pitcher.get("outsResearchPriorityScore") is not None
+    ]
+    return {
+        "gamePk": game.get("gamePk"),
+        "gameDate": game.get("gameDate"),
+        "gameTime": _format_game_time(game.get("gameDate")),
+        "status": game.get("status", {}).get("detailedState"),
+        "matchup": f"{away_code}@{home_code}",
+        "awayTeam": away.get("team", {}).get("name"),
+        "homeTeam": home.get("team", {}).get("name"),
+        "venue": game.get("venue", {}).get("name"),
+        "pitchers": pitchers,
+        "gameResearchPriorityScore": max(available_scores) if available_scores else None,
+    }
+
+
+def _outs_tie_breaker_score(pitcher):
+    recent = pitcher.get("recentLast5", {})
+    recent10 = pitcher.get("recentLast10", {})
+    model = pitcher.get("expectedOutsModel", {})
+    confidence = model.get("confidence", {})
+    score = (
+        0.35 * _normalize_score(model.get("expectedOuts"), 12, 20)
+        + 0.25 * _normalize_score(recent.get("averageOuts"), 12, 20)
+        + 0.20 * _normalize_score(recent.get("averagePitches"), 75, 100)
+        + 0.20 * _normalize_score(confidence.get("score") or 0, 0, 4)
+    )
+    if recent10.get("outsStdDev") is not None and recent10.get("outsStdDev") <= 2.0:
+        score += 0.03
+    return round(score * 100, 1)
+
+
+def _sort_by_expected_outs_with_ties(pitchers):
+    base = sorted(
+        pitchers,
+        key=lambda pitcher: (
+            pitcher.get("expectedOuts")
+            if pitcher.get("expectedOuts") is not None
+            else -1,
+            pitcher.get("tieBreakerScore") or 0,
+        ),
+        reverse=True,
+    )
+    clusters = []
+    current = []
+    anchor = None
+    for pitcher in base:
+        expected_outs = pitcher.get("expectedOuts")
+        if expected_outs is None:
+            if current:
+                clusters.append(current)
+                current = []
+                anchor = None
+            clusters.append([pitcher])
+            continue
+        if anchor is None:
+            anchor = expected_outs
+            current = [pitcher]
+            continue
+        if anchor - expected_outs < 0.75:
+            current.append(pitcher)
+        else:
+            clusters.append(current)
+            anchor = expected_outs
+            current = [pitcher]
+    if current:
+        clusters.append(current)
+
+    ranked = []
+    for cluster in clusters:
+        if len(cluster) > 1:
+            cluster = sorted(
+                cluster,
+                key=lambda pitcher: pitcher.get("tieBreakerScore") or 0,
+                reverse=True,
+            )
+            for pitcher in cluster:
+                pitcher["rankingCluster"] = "Expected-outs gap under 0.75; tie-breakers ordered this cluster."
+        ranked.extend(cluster)
+    return ranked
+
+
+def _outs_stage1_group(pitcher):
+    expected_outs = pitcher.get("expectedOuts")
+    confidence = pitcher.get("workloadConfidence")
+    last5_outs = pitcher.get("recentLast5AverageOuts")
+    last5_pitches = pitcher.get("recentLast5AveragePitches")
+
+    if expected_outs is None:
+        return "PASS FOR NOW"
+    if expected_outs >= 16.0 and confidence != "Low":
+        return "RESEARCH"
+    if (
+        expected_outs >= 15.5
+        and last5_outs is not None
+        and last5_outs >= 15.0
+        and last5_pitches is not None
+        and last5_pitches >= 88
+        and confidence in {"Medium+", "High", "High+"}
+    ):
+        return "RESEARCH"
+    if expected_outs >= 14.5 or confidence in {"Medium+", "High", "High+"}:
+        return "BORDERLINE"
+    return "PASS FOR NOW"
+
+
+def _outs_group_reason(pitcher):
+    expected_outs = pitcher.get("expectedOuts")
+    last5_outs = pitcher.get("recentLast5AverageOuts")
+    last5_pitches = pitcher.get("recentLast5AveragePitches")
+    confidence = pitcher.get("workloadConfidence")
+    efficiency = pitcher.get("pitchesPerOutLast10")
+
+    if expected_outs is None:
+        return "Missing expected-outs estimate."
+    if pitcher.get("stage1Group") == "RESEARCH":
+        return "Expected outs, recent length, pitch count, and workload profile are strong enough for pitcher-outs screenshots."
+    if pitcher.get("stage1Group") == "BORDERLINE":
+        concerns = []
+        if expected_outs < 16:
+            concerns.append("expected outs below primary research group")
+        if last5_outs is not None and last5_outs < 15.5:
+            concerns.append("recent outs are mixed")
+        if last5_pitches is not None and last5_pitches < 88:
+            concerns.append("recent pitch count is not strong")
+        if efficiency is not None and efficiency >= 5.8:
+            concerns.append("pitches-per-out efficiency risk")
+        if confidence == "Low":
+            concerns.append("low workload confidence")
+        return "; ".join(concerns[:2]) or "Interesting but needs a soft outs line."
+    reasons = []
+    if expected_outs < 14.5:
+        reasons.append("expected outs below screen threshold")
+    if last5_pitches is not None and last5_pitches < 84:
+        reasons.append("light recent pitch count")
+    if last5_outs is not None and last5_outs < 14:
+        reasons.append("short recent outings")
+    if confidence == "Low":
+        reasons.append("low workload confidence")
+    return "; ".join(reasons[:2]) or "Does not clear the Stage 1 outs threshold."
+
+
+def _outs_rank_gap_notes(ranked):
+    notes = [
+        "Expected-outs gap guide: under 0.75 = basically tied; 0.75-1.49 = small edge; 1.50-2.49 = meaningful edge; 2.50+ = major edge.",
+    ]
+    expected_values = [
+        pitcher.get("expectedOuts")
+        for pitcher in ranked
+        if pitcher.get("expectedOuts") is not None
+    ]
+    if len(expected_values) < 2:
+        return notes
+    top_gap = round(abs(expected_values[0] - expected_values[1]), 1)
+    notes.append(
+        f"Ranks 1-2 are separated by {top_gap} expected outs: {_outs_gap_label(top_gap)}."
+    )
+    tight_clusters = []
+    cluster_start = 0
+    cluster_values = []
+    for index, expected in enumerate(expected_values):
+        proposed = cluster_values + [expected]
+        if proposed and max(proposed) - min(proposed) < 0.75:
+            cluster_values = proposed
+            continue
+        if len(cluster_values) > 1:
+            tight_clusters.append((cluster_start + 1, index))
+        cluster_start = index
+        cluster_values = [expected]
+    if len(cluster_values) > 1:
+        tight_clusters.append((cluster_start + 1, len(expected_values)))
+    if tight_clusters:
+        notes.append(
+            "Tight ranking clusters: "
+            + ", ".join(f"Ranks {start}-{end}" for start, end in tight_clusters)
+            + " are within 0.75 expected outs, so tie-breakers matter."
+        )
+    return notes
+
+
+def _rank_out_screening_pitchers(games, limit=10):
+    pitchers = []
+    for game in games:
+        for pitcher in game.get("pitchers", []):
+            score = pitcher.get("outsResearchPriorityScore")
+            if not pitcher.get("available") or score is None:
+                continue
+
+            recent = pitcher.get("recentLast5", {})
+            recent10 = pitcher.get("recentLast10", {})
+            model = pitcher.get("expectedOutsModel", {})
+            expected_model = model.get("expectedOutsModel", {})
+            confidence = model.get("confidence", {})
+            expected_range = model.get("expectedOutsRange") or {}
+            flat_pitcher = {
+                "pitcherId": pitcher.get("id"),
+                "pitcher": pitcher.get("name"),
+                "team": pitcher.get("team"),
+                "opponent": pitcher.get("opponent"),
+                "matchup": game.get("matchup"),
+                "gameDate": game.get("gameDate"),
+                "gameTime": game.get("gameTime"),
+                "venue": game.get("venue"),
+                "throws": pitcher.get("throws"),
+                "outsResearchPriorityScore": score,
+                "expectedOuts": model.get("expectedOuts"),
+                "expectedIP": model.get("expectedIP"),
+                "expectedOutsRange": expected_range.get("display"),
+                "workloadConfidence": confidence.get("label"),
+                "workloadConfidenceScore": confidence.get("score"),
+                "lineupStatus": model.get("lineupStatus"),
+                "expectedOutsBase": expected_model.get("baseExpectedOuts"),
+                "expectedOutsAdjustments": expected_model.get("adjustments"),
+                "seasonOutsPerStart": expected_model.get("seasonOutsPerStart"),
+                "pitchesPerOutLast10": expected_model.get("pitchesPerOutLast10"),
+                "pitchesPerBatterFacedLast10": expected_model.get("pitchesPerBatterFacedLast10"),
+                "recentLast5AverageOuts": recent.get("averageOuts"),
+                "recentLast5AveragePitches": recent.get("averagePitches"),
+                "recentLast5AverageBattersFaced": recent.get("averageBattersFaced"),
+                "recentLast10AverageOuts": recent10.get("averageOuts"),
+                "recentLast10AveragePitches": recent10.get("averagePitches"),
+                "recentLast10AverageBattersFaced": recent10.get("averageBattersFaced"),
+                "recommendedForDeeperResearch": False,
+                "screeningNotes": [
+                    "Use Expected Outs as the primary Stage 1 ranking field.",
+                    "Use measurable workload data only. Reputation or name value is not a reason to research a pitcher.",
+                    "This is a research shortlist, not a bet recommendation.",
+                    "Bet365 pitcher-outs line, price, lineup, news, and weather still require later checks.",
+                ],
+            }
+            flat_pitcher["tieBreakerScore"] = _outs_tie_breaker_score(pitcher)
+            pitchers.append(flat_pitcher)
+
+    ranked = _sort_by_expected_outs_with_ties(pitchers)
+    if ranked:
+        top_expected = ranked[0].get("expectedOuts")
+        second_expected = ranked[1].get("expectedOuts") if len(ranked) > 1 else None
+        top_gap = (
+            round(top_expected - second_expected, 1)
+            if top_expected is not None and second_expected is not None
+            else None
+        )
+        if (
+            ranked[0].get("workloadConfidence") == "High"
+            and ranked[0].get("expectedOuts") is not None
+            and ranked[0]["expectedOuts"] >= 18
+            and (top_gap is None or top_gap >= 1.5 or ranked[0]["expectedOuts"] >= 19)
+        ):
+            ranked[0]["workloadConfidence"] = "High+"
+            ranked[0]["screeningNotes"].append(
+                "High+ means top-tier outs research priority, not a bet recommendation."
+            )
+
+    for index, pitcher in enumerate(ranked):
+        previous_expected = ranked[index - 1].get("expectedOuts") if index else None
+        current_expected = pitcher.get("expectedOuts")
+        gap = (
+            round(abs(previous_expected - current_expected), 1)
+            if previous_expected is not None and current_expected is not None
+            else None
+        )
+        pitcher["expectedOutsGapFromPrevious"] = gap
+        pitcher["expectedOutsGapLabel"] = _outs_gap_label(gap) if gap is not None else None
+        pitcher["stage1Group"] = _outs_stage1_group(pitcher)
+        pitcher["recommendedForDeeperResearch"] = pitcher["stage1Group"] == "RESEARCH"
+        pitcher["groupReason"] = _outs_group_reason(pitcher)
+
+    recommended = [
+        pitcher
+        for pitcher in ranked
+        if pitcher.get("recommendedForDeeperResearch")
+    ][:limit]
+    not_selected = [
+        pitcher
+        for pitcher in ranked
+        if pitcher.get("pitcherId")
+        not in {item.get("pitcherId") for item in recommended}
+    ]
+    for rank, pitcher in enumerate(recommended, start=1):
+        pitcher["researchRank"] = rank
+    for rank, pitcher in enumerate(not_selected, start=len(recommended) + 1):
+        pitcher["screenRank"] = rank
+    screening_groups = {
+        "research": [pitcher for pitcher in ranked if pitcher.get("stage1Group") == "RESEARCH"],
+        "borderline": [pitcher for pitcher in ranked if pitcher.get("stage1Group") == "BORDERLINE"],
+        "passForNow": [pitcher for pitcher in ranked if pitcher.get("stage1Group") == "PASS FOR NOW"],
+    }
+    for group_pitchers in screening_groups.values():
+        for rank, pitcher in enumerate(group_pitchers, start=1):
+            pitcher["groupRank"] = rank
+    return recommended, not_selected, screening_groups, _outs_rank_gap_notes(ranked)
+
+
+def _compact_out_pitcher(pitcher):
+    return {
+        "rank": pitcher.get("groupRank"),
+        "overallRank": pitcher.get("researchRank") or pitcher.get("screenRank"),
+        "pitcherId": pitcher.get("pitcherId"),
+        "pitcher": pitcher.get("pitcher"),
+        "team": pitcher.get("team"),
+        "matchup": pitcher.get("matchup"),
+        "gameTime": pitcher.get("gameTime"),
+        "throws": pitcher.get("throws"),
+        "expectedOuts": pitcher.get("expectedOuts"),
+        "expectedIP": pitcher.get("expectedIP"),
+        "expectedOutsRange": pitcher.get("expectedOutsRange"),
+        "workloadConfidence": pitcher.get("workloadConfidence"),
+        "stage1Group": pitcher.get("stage1Group"),
+        "expectedOutsGapFromPrevious": pitcher.get("expectedOutsGapFromPrevious"),
+        "expectedOutsGapLabel": pitcher.get("expectedOutsGapLabel"),
+        "groupReason": pitcher.get("groupReason"),
+        "lineupStatus": pitcher.get("lineupStatus"),
+        "recentLast5AverageOuts": pitcher.get("recentLast5AverageOuts"),
+        "recentLast5AveragePitches": pitcher.get("recentLast5AveragePitches"),
+        "recentLast5AverageBattersFaced": pitcher.get("recentLast5AverageBattersFaced"),
+        "recentLast10AverageOuts": pitcher.get("recentLast10AverageOuts"),
+        "recentLast10AveragePitches": pitcher.get("recentLast10AveragePitches"),
+        "recentLast10AverageBattersFaced": pitcher.get("recentLast10AverageBattersFaced"),
+        "pitchesPerOutLast10": pitcher.get("pitchesPerOutLast10"),
+        "outsResearchPriorityScore": pitcher.get("outsResearchPriorityScore"),
+    }
+
+
+def _compact_out_game(game):
+    pitchers = []
+    for pitcher in game.get("pitchers", []):
+        if pitcher.get("available"):
+            model = pitcher.get("expectedOutsModel", {})
+            pitchers.append(
+                {
+                    "pitcherId": pitcher.get("id"),
+                    "pitcher": pitcher.get("name"),
+                    "team": pitcher.get("team"),
+                    "opponent": pitcher.get("opponent"),
+                    "throws": pitcher.get("throws"),
+                    "available": True,
+                    "expectedOuts": model.get("expectedOuts"),
+                    "expectedIP": model.get("expectedIP"),
+                    "workloadConfidence": model.get("confidence", {}).get("label"),
+                    "outsResearchPriorityScore": pitcher.get("outsResearchPriorityScore"),
+                }
+            )
+        else:
+            pitchers.append(
+                {
+                    "pitcherId": pitcher.get("id"),
+                    "pitcher": pitcher.get("name"),
+                    "team": pitcher.get("team"),
+                    "opponent": pitcher.get("opponent"),
+                    "available": False,
+                    "reason": pitcher.get("reason"),
+                }
+            )
+
+    return {
+        "gamePk": game.get("gamePk"),
+        "gameDate": game.get("gameDate"),
+        "gameTime": game.get("gameTime"),
+        "status": game.get("status"),
+        "matchup": game.get("matchup"),
+        "awayTeam": game.get("awayTeam"),
+        "homeTeam": game.get("homeTeam"),
+        "venue": game.get("venue"),
+        "pitchers": pitchers,
+    }
+
+
+def _compact_out_groups(screening_groups):
+    return {
+        group: [_compact_out_pitcher(pitcher) for pitcher in pitchers]
+        for group, pitchers in screening_groups.items()
+    }
+
+
+def _outs_dashboard_row(pitcher):
+    return {
+        "rank": pitcher.get("rank"),
+        "pitcher": pitcher.get("pitcher"),
+        "team": pitcher.get("team") or "N/A",
+        "matchup": pitcher.get("matchup"),
+        "gameTime": pitcher.get("gameTime") or "N/A",
+        "hand": pitcher.get("throws") or "N/A",
+        "expOuts": _format_number(pitcher.get("expectedOuts")),
+        "expIP": pitcher.get("expectedIP") or "N/A",
+        "last5AvgOuts": _format_number(pitcher.get("recentLast5AverageOuts")),
+        "last10AvgOuts": _format_number(pitcher.get("recentLast10AverageOuts")),
+        "last5AvgPitches": _format_number(pitcher.get("recentLast5AveragePitches")),
+        "last5AvgBF": _format_number(pitcher.get("recentLast5AverageBattersFaced")),
+        "workloadConfidence": pitcher.get("workloadConfidence") or "N/A",
+        "gapNote": pitcher.get("expectedOutsGapLabel") or "top rank",
+        "whyConcern": pitcher.get("groupReason") or "N/A",
+    }
+
+
+def _outs_stage1_dashboard(date, requested, unmatched, compact_games, compact_groups, rank_gap_notes):
+    research_rows = [_outs_dashboard_row(pitcher) for pitcher in compact_groups.get("research", [])]
+    borderline_rows = [_outs_dashboard_row(pitcher) for pitcher in compact_groups.get("borderline", [])]
+    pass_rows = [_outs_dashboard_row(pitcher) for pitcher in compact_groups.get("passForNow", [])]
+    pitchers_screened = len(research_rows) + len(borderline_rows) + len(pass_rows)
+    display_columns = [
+        {"key": "rank", "label": "Rank"},
+        {"key": "pitcher", "label": "Pitcher"},
+        {"key": "team", "label": "Team"},
+        {"key": "matchup", "label": "Matchup"},
+        {"key": "gameTime", "label": "Game Time"},
+        {"key": "hand", "label": "Hand"},
+        {"key": "expOuts", "label": "Exp Outs"},
+        {"key": "expIP", "label": "Exp IP"},
+        {"key": "last5AvgOuts", "label": "Last 5 Avg Outs"},
+        {"key": "last10AvgOuts", "label": "Last 10 Avg Outs"},
+        {"key": "last5AvgPitches", "label": "Last 5 Avg Pitches"},
+        {"key": "last5AvgBF", "label": "Last 5 Avg BF"},
+        {"key": "workloadConfidence", "label": "Workload Confidence"},
+        {"key": "gapNote", "label": "Gap Note"},
+        {"key": "whyConcern", "label": "Why / Concern"},
+    ]
+    what_next = [
+        "No bets yet.",
+        "Approve the RESEARCH group before Stage 2.",
+        "Send Bet365 pitcher-outs screenshots for the RESEARCH group first.",
+    ]
+    if not research_rows:
+        what_next.append("No RESEARCH pitchers cleared the screen. Consider No Bet Day or ask about BORDERLINE soft-line checks.")
+    stage2_targets = [
+        {
+            "rank": row.get("rank"),
+            "pitcher": row.get("pitcher"),
+            "team": row.get("team"),
+            "matchup": row.get("matchup"),
+            "gameTime": row.get("gameTime"),
+        }
+        for row in research_rows
+    ]
+    borderline_option = (
+        "Optional: include BORDERLINE pitchers only if you want to check for unusually soft Bet365 outs lines."
+        if borderline_rows
+        else None
+    )
+    dashboard = {
+        "title": "MLB Pitcher Outs Screen",
+        "subtitle": "Research only. No bets yet.",
+        "slateRead": {
+            "date": date,
+            "requestedMatchups": [f"{away}@{home}" for away, home in requested],
+            "unmatchedRequestedMatchups": unmatched,
+            "gamesReturned": len(compact_games),
+            "pitchersScreened": pitchers_screened,
+            "lineupStatus": "Unavailable from helper unless user/browser confirms projected or confirmed lineups.",
+            "pitcherOutsOddsReviewed": "No",
+        },
+        "rankGapNotes": rank_gap_notes,
+        "tables": {
+            "research": {"title": "RESEARCH", "displayColumns": display_columns, "rows": research_rows},
+            "borderline": {"title": "BORDERLINE", "displayColumns": display_columns, "rows": borderline_rows},
+            "passForNow": {"title": "PASS FOR NOW", "displayColumns": display_columns, "rows": pass_rows},
+        },
+        "unavailablePitchers": _unavailable_pitchers(compact_games),
+        "stage2ScreenshotTargets": stage2_targets,
+        "borderlineOption": borderline_option,
+        "whatINeedNext": what_next,
+        "displayRules": [
+            "Use this section order: Slate Read, rankGapNotes, RESEARCH, BORDERLINE, PASS FOR NOW, What I Need Next.",
+            "Use these rows in the returned order.",
+            "Use every displayColumns entry for each table, in the returned order.",
+            "Use outsStage1ReportMarkdown exactly when available.",
+            "Do not rename teams, reorder rows, upgrade confidence, or rewrite group reasons.",
+            "High+ is research priority only, not a bet.",
+        ],
+    }
+    dashboard["outsStage1ReportMarkdown"] = _outs_stage1_report_markdown(dashboard)
+    return dashboard
+
+
+def _outs_stage1_report_markdown(dashboard):
+    slate = dashboard.get("slateRead", {})
+    lines = [
+        "Slate Read",
+        "",
+        f"{dashboard.get('title')} - {dashboard.get('subtitle')}",
+        "",
+        _markdown_table(
+            ["Field", "Value"],
+            [
+                ["Date", slate.get("date")],
+                ["Games Returned", slate.get("gamesReturned")],
+                ["Pitchers Screened", slate.get("pitchersScreened")],
+                ["Pitcher-Outs Odds Reviewed", slate.get("pitcherOutsOddsReviewed")],
+                ["Lineup Status", slate.get("lineupStatus")],
+                ["Unmatched Requested Matchups", ", ".join(slate.get("unmatchedRequestedMatchups") or []) or "None"],
+            ],
+        ),
+    ]
+    unavailable = dashboard.get("unavailablePitchers") or []
+    if unavailable:
+        lines.extend(
+            [
+                "",
+                "Unavailable Pitchers",
+                "",
+                _markdown_table(
+                    ["Matchup", "Game Time", "Team", "Pitcher", "Reason"],
+                    [
+                        [item.get("matchup"), item.get("gameTime"), item.get("team"), item.get("pitcher"), item.get("reason")]
+                        for item in unavailable
+                    ],
+                ),
+            ]
+        )
+    lines.extend(["", "rankGapNotes", ""])
+    lines.append(_markdown_table(["#", "Note"], [[index, note] for index, note in enumerate(dashboard.get("rankGapNotes") or [], start=1)]))
+    for table_key in ("research", "borderline", "passForNow"):
+        table = dashboard.get("tables", {}).get(table_key, {})
+        columns = table.get("displayColumns") or []
+        rows = table.get("rows") or []
+        headers = [column.get("label") for column in columns]
+        keys = [column.get("key") for column in columns]
+        lines.extend(["", table.get("title", table_key), ""])
+        lines.append(_markdown_table(headers, [[row.get(key) for key in keys] for row in rows]))
+    lines.extend(["", "What I Need Next", ""])
+    for item in dashboard.get("whatINeedNext") or []:
+        lines.append(item)
+    targets = dashboard.get("stage2ScreenshotTargets") or []
+    if targets:
+        lines.extend(
+            [
+                "",
+                "Stage 2 Screenshot Targets",
+                "",
+                _markdown_table(
+                    ["Rank", "Pitcher", "Team", "Matchup", "Game Time"],
+                    [
+                        [target.get("rank"), target.get("pitcher"), target.get("team"), target.get("matchup"), target.get("gameTime")]
+                        for target in targets
+                    ],
+                ),
+            ]
+        )
+    if dashboard.get("borderlineOption"):
+        lines.extend(["", dashboard["borderlineOption"]])
+    return "\n".join(lines)
+
+
+def _outs_result_vs_line(outs, line, side):
+    if outs is None or line is None:
+        return "N/A"
+    if outs == line:
+        return "Push"
+    if side == "over":
+        return "Yes" if outs > line else "No"
+    return "Yes" if outs < line else "No"
+
+
+def _outs_start_row(split, person_id, line):
+    stat = split.get("stat", {})
+    game_pk = _game_pk(split)
+    pitch_count = stat.get("numberOfPitches")
+    if pitch_count is None:
+        pitch_count = _pitch_count_from_boxscore(game_pk, person_id)
+    outs = _innings_to_outs(stat.get("inningsPitched"))
+    return {
+        "date": split.get("date"),
+        "opponent": split.get("opponent", {}).get("name"),
+        "inningsPitched": stat.get("inningsPitched"),
+        "outs": outs,
+        "pitches": _num(pitch_count, None) if pitch_count is not None else None,
+        "battersFaced": _num(stat.get("battersFaced"), None),
+        "walks": _num(stat.get("baseOnBalls"), None),
+        "earnedRuns": _num(stat.get("earnedRuns"), None),
+        "overResult": _outs_result_vs_line(outs, line, "over"),
+        "underResult": _outs_result_vs_line(outs, line, "under"),
+    }
+
+
+def _outs_hit_summary(starts, line, sample):
+    items = starts[:sample]
+    if not items:
+        return {
+            "sample": 0,
+            "averageOuts": None,
+            "averageIP": None,
+            "averagePitches": None,
+            "averageBattersFaced": None,
+            "over": "0/0",
+            "under": "0/0",
+        }
+    over_hits = sum(1 for start in items if start.get("outs") is not None and start["outs"] > line)
+    under_hits = sum(1 for start in items if start.get("outs") is not None and start["outs"] < line)
+    pushes = sum(1 for start in items if start.get("outs") == line)
+    suffix = f", {pushes} push" if pushes == 1 else f", {pushes} pushes" if pushes else ""
+    avg_outs = _avg([start.get("outs") for start in items])
+    return {
+        "sample": len(items),
+        "averageOuts": avg_outs,
+        "averageIP": _expected_ip_text(avg_outs) if avg_outs is not None else None,
+        "averagePitches": _avg([start.get("pitches") for start in items]),
+        "averageBattersFaced": _avg([start.get("battersFaced") for start in items]),
+        "over": f"{over_hits}/{len(items)}{suffix}",
+        "under": f"{under_hits}/{len(items)}{suffix}",
+    }
+
+
+def _outs_recent_starts_from_splits(person_id, line, splits):
+    starts = [_outs_start_row(split, person_id, line) for split in splits]
+    return {
+        "starts": starts,
+        "last5": _outs_hit_summary(starts, line, 5),
+        "last10": _outs_hit_summary(starts, line, 10),
+    }
+
+
+def _outs_decision(candidate, expected_outs, summary):
+    line = candidate.get("line")
+    over_odds = candidate.get("overOdds")
+    under_odds = candidate.get("underOdds")
+    gap = round(expected_outs - line, 1) if expected_outs is not None and line is not None else None
+    last5 = summary.get("last5", {})
+    last10 = summary.get("last10", {})
+    avg_pitches = last5.get("averagePitches")
+    avg_bf = last5.get("averageBattersFaced")
+    over_l10_hits = _num(str(last10.get("over", "0/0")).split("/")[0], 0)
+    under_l10_hits = _num(str(last10.get("under", "0/0")).split("/")[0], 0)
+    over_in_range = _odds_in_range(over_odds)
+    under_in_range = _odds_in_range(under_odds)
+
+    if gap is None:
+        return {
+            "bestSide": "Monitor Both Sides",
+            "status": "Blocked",
+            "reason": "Expected outs unavailable, so side cannot be judged cleanly.",
+            "gap": gap,
+        }
+
+    workload_ok = (
+        (avg_pitches is None or avg_pitches >= 86)
+        and (avg_bf is None or avg_bf >= 21)
+    )
+    if gap >= 1.0 and over_in_range and workload_ok and (
+        over_l10_hits >= 6 or (over_l10_hits >= 5 and (last5.get("averageOuts") or 0) >= line + 1)
+    ):
+        return {
+            "bestSide": "Over Candidate",
+            "status": "Carry Forward",
+            "reason": "Expected outs are meaningfully above the line, Over price is in range, and recent workload supports the Over.",
+            "gap": gap,
+        }
+    if gap <= -1.0 and under_in_range and under_l10_hits >= 5:
+        return {
+            "bestSide": "Under Candidate",
+            "status": "Carry Forward",
+            "reason": "Expected outs are meaningfully below the line, Under price is in range, and recent length supports the Under.",
+            "gap": gap,
+        }
+    if not over_in_range and not under_in_range:
+        return {
+            "bestSide": "Pass Both Sides",
+            "status": "Pass Both Sides",
+            "reason": "Both prices are outside the 1.40-1.95 range.",
+            "gap": gap,
+        }
+    if abs(gap) < 1.0:
+        return {
+            "bestSide": "Monitor Both Sides",
+            "status": "Monitor",
+            "reason": "Expected outs are close to the line, so price, lineup, weather, and recheck context matter.",
+            "gap": gap,
+        }
+    return {
+        "bestSide": "Monitor Both Sides",
+        "status": "Monitor",
+        "reason": "There is a directional lean, but price, workload, or recent hit rate is not clean enough yet.",
+        "gap": gap,
+    }
+
+
+def _stage2_outs_candidate_profile(candidate, season, games_by_matchup, date):
+    game = games_by_matchup.get(candidate.get("matchup"))
+    game_time = _format_game_time(game.get("gameDate")) if game else "N/A"
+    pitcher = _find_pitcher(candidate["pitcher"])
+    if not pitcher:
+        return {
+            "candidate": candidate,
+            "gameTime": game_time,
+            "error": f"No pitcher found for {candidate['pitcher']}.",
+        }
+    opponent_team_id = _opponent_team_id_for_candidate(candidate, games_by_matchup)
+    expected_outs = None
+    expected_ip = None
+    if opponent_team_id:
+        profile = _pitcher_outs_screening_profile(
+            pitcher["id"],
+            opponent_team_id,
+            season,
+            before_date=date,
+        )
+        expected_model = profile.get("expectedOutsModel", {})
+        expected_outs = expected_model.get("expectedOuts")
+        expected_ip = expected_model.get("expectedIP")
+    recent_splits = _stage2_recent_start_splits(
+        pitcher["id"],
+        season,
+        limit=10,
+        before_date=date,
+    )
+    recent = _outs_recent_starts_from_splits(pitcher["id"], candidate["line"], recent_splits)
+    decision = _outs_decision(candidate, expected_outs, recent)
+    return {
+        "candidate": candidate,
+        "pitcherId": pitcher["id"],
+        "pitcher": pitcher.get("fullName") or candidate["pitcher"],
+        "team": candidate.get("team"),
+        "matchup": candidate.get("matchup"),
+        "gameTime": game_time,
+        "line": candidate.get("line"),
+        "overOdds": candidate.get("overOdds"),
+        "underOdds": candidate.get("underOdds"),
+        "expectedOuts": expected_outs,
+        "expectedIP": expected_ip,
+        "gapVsLine": decision.get("gap"),
+        "bestSide": decision.get("bestSide"),
+        "status": decision.get("status"),
+        "reason": decision.get("reason"),
+        "recent": recent,
+        "error": None,
+    }
+
+
+def _outs_line_read_row(profile):
+    candidate = profile.get("candidate", {})
+    return [
+        profile.get("pitcher") or candidate.get("pitcher"),
+        candidate.get("team"),
+        candidate.get("matchup"),
+        profile.get("gameTime") or "N/A",
+        _line(candidate.get("line")),
+        _decimal(candidate.get("overOdds")),
+        _decimal(candidate.get("underOdds")),
+        candidate.get("readStatus", "Readable") if not profile.get("error") else profile.get("error"),
+    ]
+
+
+def _outs_side_row(profile):
+    recent = profile.get("recent", {})
+    last5 = recent.get("last5", {})
+    last10 = recent.get("last10", {})
+    return [
+        profile.get("pitcher"),
+        profile.get("team"),
+        profile.get("matchup"),
+        profile.get("gameTime") or "N/A",
+        _line(profile.get("line")),
+        _format_number(profile.get("expectedOuts")),
+        profile.get("expectedIP") or "N/A",
+        _format_number(profile.get("gapVsLine")),
+        _decimal(profile.get("overOdds")),
+        _decimal(profile.get("underOdds")),
+        f"{last5.get('over')} / {last10.get('over')}",
+        f"{last5.get('under')} / {last10.get('under')}",
+        _format_number(last5.get("averagePitches")),
+        _format_number(last5.get("averageBattersFaced")),
+        profile.get("bestSide"),
+        profile.get("status"),
+        profile.get("reason"),
+    ]
+
+
+def _outs_start_log_table(profile):
+    line = profile.get("line")
+    rows = []
+    for index, start in enumerate(profile.get("recent", {}).get("starts", []), start=1):
+        rows.append(
+            [
+                "Yes" if index <= 5 else "No",
+                start.get("date"),
+                start.get("opponent"),
+                start.get("inningsPitched"),
+                start.get("outs"),
+                start.get("pitches"),
+                start.get("battersFaced"),
+                start.get("overResult"),
+                start.get("underResult"),
+            ]
+        )
+    return _markdown_table(
+        [
+            "Last 5?",
+            "Date",
+            "Opp",
+            "IP",
+            "Outs",
+            "Pitches",
+            "BF",
+            f"Over {_line(line)}?",
+            f"Under {_line(line)}?",
+        ],
+        rows,
+    )
+
+
+def _outs_summary_table(profile):
+    recent = profile.get("recent", {})
+    return _markdown_table(
+        ["Sample", "Avg Outs", "Avg IP", "Over", "Under", "Avg Pitches", "Avg BF"],
+        [
+            [
+                "Last 5",
+                _format_number(recent.get("last5", {}).get("averageOuts")),
+                recent.get("last5", {}).get("averageIP") or "N/A",
+                recent.get("last5", {}).get("over"),
+                recent.get("last5", {}).get("under"),
+                _format_number(recent.get("last5", {}).get("averagePitches")),
+                _format_number(recent.get("last5", {}).get("averageBattersFaced")),
+            ],
+            [
+                "Last 10",
+                _format_number(recent.get("last10", {}).get("averageOuts")),
+                recent.get("last10", {}).get("averageIP") or "N/A",
+                recent.get("last10", {}).get("over"),
+                recent.get("last10", {}).get("under"),
+                _format_number(recent.get("last10", {}).get("averagePitches")),
+                _format_number(recent.get("last10", {}).get("averageBattersFaced")),
+            ],
+        ],
+    )
+
+
+def _stage2_outs_report_markdown(date, profiles, parse_errors):
+    lines = [
+        "Stage 2 Pitcher-Outs Research",
+        "",
+        "Research only. No final bets yet.",
+        "",
+        "Bet365 Lines Read",
+        "",
+        _markdown_table(
+            ["Pitcher", "Team", "Matchup", "Game Time", "Outs Line", "Over Odds", "Under Odds", "Read Status"],
+            [_outs_line_read_row(profile) for profile in profiles],
+        ),
+    ]
+    if parse_errors:
+        lines.extend(
+            [
+                "",
+                "Unreadable / Parsing Issues",
+                "",
+                _markdown_table(
+                    ["#", "Raw", "Issue"],
+                    [[error.get("index"), error.get("raw"), error.get("error")] for error in parse_errors],
+                ),
+            ]
+        )
+    usable = [profile for profile in profiles if not profile.get("error")]
+    lines.extend(
+        [
+            "",
+            "Side Comparison Board",
+            "",
+            _markdown_table(
+                [
+                    "Pitcher",
+                    "Team",
+                    "Matchup",
+                    "Game Time",
+                    "Outs Line",
+                    "Exp Outs",
+                    "Exp IP",
+                    "Gap vs Line",
+                    "Over Odds",
+                    "Under Odds",
+                    "Over L5/L10",
+                    "Under L5/L10",
+                    "Avg Pitches",
+                    "Avg BF",
+                    "Best Side",
+                    "Status",
+                    "Reason",
+                ],
+                [_outs_side_row(profile) for profile in usable],
+            ),
+        ]
+    )
+    for title, statuses in (
+        ("CARRY FORWARD", {"Carry Forward"}),
+        ("MONITOR", {"Monitor", "Blocked"}),
+        ("PASS BOTH SIDES", {"Pass Both Sides"}),
+    ):
+        group = [profile for profile in usable if profile.get("status") in statuses]
+        lines.extend(["", title, ""])
+        if not group:
+            lines.append("None")
+            continue
+        lines.append(
+            _markdown_table(
+                ["Pitcher", "Team", "Matchup", "Game Time", "Outs Line", "Best Side", "Status", "Reason"],
+                [
+                    [
+                        profile.get("pitcher"),
+                        profile.get("team"),
+                        profile.get("matchup"),
+                        profile.get("gameTime") or "N/A",
+                        _line(profile.get("line")),
+                        profile.get("bestSide"),
+                        profile.get("status"),
+                        profile.get("reason"),
+                    ]
+                    for profile in group
+                ],
+            )
+        )
+    lines.extend(["", "Actual Last 10 Start Logs"])
+    for profile in usable:
+        lines.extend(
+            [
+                "",
+                f"{profile.get('pitcher')} - {profile.get('team')} - {profile.get('matchup')} - {profile.get('gameTime') or 'N/A'}",
+                f"Line: {_line(profile.get('line'))} outs | Best Side: {profile.get('bestSide')} | Status: {profile.get('status')}",
+                "",
+                _outs_start_log_table(profile),
+                "",
+                _outs_summary_table(profile),
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "What I Need Next",
+            "",
+            "Tell me your next available recheck time today.",
+            "Example: I can recheck at 9:00 PM Atlantic.",
+            "",
+            "If you cannot recheck later, say: I cannot recheck later today.",
+            "",
+            "If you want to proceed now, send updated Bet365 screenshots for the Carry Forward / Monitor candidates.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _stage2_outs_compact_profile(profile):
+    if profile.get("error"):
+        candidate = profile.get("candidate", {})
+        return {
+            "pitcher": candidate.get("pitcher"),
+            "team": candidate.get("team"),
+            "matchup": candidate.get("matchup"),
+            "gameTime": profile.get("gameTime") or "N/A",
+            "error": profile.get("error"),
+        }
+    return {
+        "pitcher": profile.get("pitcher"),
+        "team": profile.get("team"),
+        "matchup": profile.get("matchup"),
+        "gameTime": profile.get("gameTime"),
+        "line": profile.get("line"),
+        "overOdds": profile.get("overOdds"),
+        "underOdds": profile.get("underOdds"),
+        "expectedOuts": profile.get("expectedOuts"),
+        "expectedIP": profile.get("expectedIP"),
+        "gapVsLine": profile.get("gapVsLine"),
+        "bestSide": profile.get("bestSide"),
+        "status": profile.get("status"),
+        "reason": profile.get("reason"),
+        "last5": profile.get("recent", {}).get("last5"),
+        "last10": profile.get("recent", {}).get("last10"),
+    }
 
 
 def _parse_stage2_candidates(raw):
@@ -2435,6 +3757,120 @@ def game_screening():
     return jsonify(payload)
 
 
+@app.get("/out-screening")
+def out_screening():
+    date = request.args.get("date") or datetime.now().strftime("%Y-%m-%d")
+    season = request.args.get("season") or date[:4]
+    include_details = str(request.args.get("include_details", "false")).lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    requested = _requested_matchups(request.args.get("matchups"))
+    games = _schedule(date)
+
+    if requested:
+        requested_set = set(requested)
+        selected_games = []
+        found = set()
+        for game in games:
+            away = _normalize_team_code(
+                game.get("teams", {}).get("away", {}).get("team", {}).get("abbreviation")
+            )
+            home = _normalize_team_code(
+                game.get("teams", {}).get("home", {}).get("team", {}).get("abbreviation")
+            )
+            if (away, home) in requested_set:
+                selected_games.append(game)
+                found.add((away, home))
+        unmatched = [
+            f"{away}@{home}"
+            for away, home in requested
+            if (away, home) not in found
+        ]
+    else:
+        selected_games = games
+        unmatched = []
+
+    screened = []
+    with ThreadPoolExecutor(max_workers=min(max(len(selected_games), 1), 8)) as executor:
+        futures = [
+            executor.submit(_format_out_screening_game, game, season)
+            for game in selected_games
+        ]
+        for future in as_completed(futures):
+            screened.append(future.result())
+
+    screened = sorted(
+        screened,
+        key=lambda game: game.get("gameResearchPriorityScore") or 0,
+        reverse=True,
+    )
+    for rank, game in enumerate(screened, start=1):
+        game["researchRank"] = rank
+    (
+        recommended_pitchers,
+        not_selected_pitchers,
+        screening_groups,
+        rank_gap_notes,
+    ) = _rank_out_screening_pitchers(screened)
+    compact_groups = _compact_out_groups(screening_groups)
+    compact_games = [_compact_out_game(game) for game in screened]
+    outs_stage1_dashboard = _outs_stage1_dashboard(
+        date,
+        requested,
+        unmatched,
+        compact_games,
+        compact_groups,
+        rank_gap_notes,
+    )
+
+    payload = {
+        "date": date,
+        "season": season,
+        "screeningOnly": True,
+        "responseMode": "compact",
+        "outsStage1Dashboard": outs_stage1_dashboard,
+        "outsStage1ReportMarkdown": outs_stage1_dashboard.get("outsStage1ReportMarkdown"),
+        "requestedMatchups": [
+            f"{away}@{home}" for away, home in requested
+        ],
+        "unmatchedRequestedMatchups": unmatched,
+        "gamesReturned": len(screened),
+        "games": compact_games,
+        "recommendedPitchers": [
+            _compact_out_pitcher(pitcher)
+            for pitcher in recommended_pitchers
+        ],
+        "notSelectedPitchers": [
+            _compact_out_pitcher(pitcher)
+            for pitcher in not_selected_pitchers
+        ],
+        "outScreeningGroups": compact_groups,
+        "rankGapNotes": rank_gap_notes,
+        "notes": [
+            "This endpoint screens games for deeper pitcher-outs research. It does not recommend bets.",
+            "Use outsStage1Dashboard for the user-facing Stage 1 report.",
+            "Use outsStage1ReportMarkdown exactly when the GPT needs a consistent ready-made Stage 1 report.",
+            "Expected Outs is the preferred Stage 1 ranking field.",
+            "Recommended pitchers come from the RESEARCH group, up to a maximum of 10.",
+            "Every screened pitcher is returned in outScreeningGroups: research, borderline, or passForNow.",
+            "Use measurable workload data only. Reputation or name value is not a reason to research a pitcher.",
+            "Send only screenshot-provided matchups in the matchups query when screening a Bet365 screenshot.",
+            "Projected lineups can support research with an uncertainty haircut, but never treat projected lineups as confirmed.",
+            "Confirm lineups, injury news, weather, Bet365 pitcher-outs lines, and prices before any final bet decision.",
+        ],
+    }
+    if include_details:
+        payload["responseMode"] = "detailed"
+        payload["debugFullGames"] = screened
+        payload["debugFullScreeningGroups"] = screening_groups
+        payload["debugFullRecommendedPitchers"] = recommended_pitchers
+        payload["debugFullNotSelectedPitchers"] = not_selected_pitchers
+
+    return jsonify(payload)
+
+
 @app.get("/pitcher-last-starts")
 def pitcher_last_starts():
     pitcher_name = request.args.get("pitcher_name", "").strip()
@@ -2487,6 +3923,67 @@ def pitcher_last_starts():
             ],
         }
     )
+
+
+@app.get("/stage2-outs-research")
+def stage2_outs_research():
+    date = request.args.get("date") or datetime.now().strftime("%Y-%m-%d")
+    season = request.args.get("season") or date[:4]
+    raw_candidates = request.args.get("candidates", "")
+    include_details = str(
+        request.args.get("include_details", "false")
+    ).lower() in {"1", "true", "yes"}
+    candidates, parse_errors = _parse_stage2_candidates(raw_candidates)
+
+    if not raw_candidates.strip():
+        return jsonify({"error": "candidates is required"}), 400
+
+    games_by_matchup = _game_lookup(date)
+    indexed_profiles = []
+    with ThreadPoolExecutor(max_workers=min(max(len(candidates), 1), 6)) as executor:
+        futures = {
+            executor.submit(
+                _stage2_outs_candidate_profile,
+                candidate,
+                season,
+                games_by_matchup,
+                date,
+            ): index
+            for index, candidate in enumerate(candidates)
+        }
+        for future in as_completed(futures):
+            indexed_profiles.append((futures[future], future.result()))
+    profiles = [
+        profile
+        for _, profile in sorted(indexed_profiles, key=lambda item: item[0])
+    ]
+    report = _stage2_outs_report_markdown(date, profiles, parse_errors)
+
+    payload = {
+        "date": date,
+        "season": season,
+        "stage": "Stage 2 Pitcher Outs",
+        "screeningOnly": True,
+        "responseMode": "compact",
+        "inputFormat": "Pitcher|Team|Matchup|OutsLine|OverOdds|UnderOdds;...",
+        "candidatesReturned": len(profiles),
+        "parseErrors": parse_errors,
+        "profiles": [_stage2_outs_compact_profile(profile) for profile in profiles],
+        "stage2OutsReportMarkdown": report,
+        "notes": [
+            "Stage 2 compares the exact Bet365 pitcher-outs line and odds supplied by the user.",
+            "This endpoint does not pull Bet365 odds. User screenshots remain the source of truth for line and price.",
+            "The report is research only. It does not make final bet recommendations.",
+            "Actual last 10 starts are shown for every readable candidate, with Last 5 marked.",
+            "Stage 2 evaluates Over and Under equally for pitcher outs.",
+            "Stage 2 ends by asking for the user's next available recheck time.",
+        ],
+    }
+    if include_details:
+        payload["responseMode"] = "detailed"
+        payload["debugFullProfiles"] = profiles
+
+    return jsonify(payload)
 
 
 @app.get("/stage2-research")
