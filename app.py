@@ -2114,8 +2114,8 @@ def _outs_stage1_dashboard(date, requested, unmatched, compact_games, compact_gr
     ]
     what_next = [
         "No bets yet.",
-        "Approve the RESEARCH group before Stage 2.",
-        "Send Bet365 pitcher-outs screenshots for the RESEARCH group first.",
+        "Approve, remove, or adjust the Stage 2 Screenshot Targets before Stage 2.",
+        "Send Bet365 pitcher-outs screenshots for the Stage 2 Screenshot Targets first.",
     ]
     if not research_rows:
         what_next.append("No RESEARCH pitchers cleared the screen. Consider No Bet Day or ask about BORDERLINE soft-line checks.")
@@ -2127,7 +2127,7 @@ def _outs_stage1_dashboard(date, requested, unmatched, compact_games, compact_gr
             "matchup": row.get("matchup"),
             "gameTime": row.get("gameTime"),
         }
-        for row in research_rows
+        for row in research_rows[:10]
     ]
     borderline_option = (
         "Optional: include BORDERLINE pitchers only if you want to check for unusually soft Bet365 outs lines."
