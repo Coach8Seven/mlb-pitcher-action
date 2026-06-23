@@ -3361,8 +3361,17 @@ def _borderline_promotion_audit(candidate, expected_ks, recent, pitch_quality, e
 
     if stage1_group != "BORDERLINE":
         decision = "Not Applicable"
+        risk_context = best.get("criticalBlockers") or best.get("borderlineDowngradeFlags") or []
+        if risk_context:
+            reason = (
+                "Primary RESEARCH/UNKNOWN candidate; promotion gate not applicable. "
+                "Risk context: " + ", ".join(risk_context[:3]) + "."
+            )
+        else:
+            reason = "Primary RESEARCH/UNKNOWN candidate; promotion gate not applicable."
     elif blockers:
         decision = "Rejected"
+        reason = _promotion_reason(best, decision)
     elif (
         best.get("adjustedEdgeQualifies")
         and best.get("gapQualifies")
@@ -3371,12 +3380,13 @@ def _borderline_promotion_audit(candidate, expected_ks, recent, pitch_quality, e
         and "smallSampleNeedsIndependentSignals" not in flags
     ):
         decision = "Promoted"
+        reason = _promotion_reason(best, decision)
     elif best.get("projectionGap") is not None and best.get("projectionGap") >= BORDERLINE_RULES["thinGap"] and not blockers:
         decision = "Monitor"
+        reason = _promotion_reason(best, decision)
     else:
         decision = "Rejected"
-
-    reason = _promotion_reason(best, decision)
+        reason = _promotion_reason(best, decision)
     return {
         "stage1Group": stage1_group,
         "bestSide": "Over Candidate" if best.get("side") == "over" else "Under Candidate",
