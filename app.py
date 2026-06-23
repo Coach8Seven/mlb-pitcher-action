@@ -3815,11 +3815,103 @@ def _stage2_summary_table(profile):
     )
 
 
+def _stage2_snapshot_table(profiles):
+    usable = [profile for profile in profiles if not profile.get("error")]
+    status_counts = {
+        "Carry Forward": sum(1 for profile in usable if profile.get("status") == "Carry Forward"),
+        "Monitor": sum(1 for profile in usable if profile.get("status") in {"Monitor", "Blocked"}),
+        "Pass Both Sides": sum(1 for profile in usable if profile.get("status") == "Pass Both Sides"),
+    }
+    borderline_decisions = {}
+    for profile in usable:
+        audit = profile.get("borderlinePromotionAudit") or {}
+        decision = audit.get("borderlinePromotionDecision")
+        if audit.get("stage1Group") == "BORDERLINE" and decision:
+            borderline_decisions[decision] = borderline_decisions.get(decision, 0) + 1
+    borderline_summary = (
+        ", ".join(f"{key}: {value}" for key, value in sorted(borderline_decisions.items()))
+        if borderline_decisions
+        else "None supplied"
+    )
+    return _markdown_table(
+        ["Item", "Count / Status"],
+        [
+            ["Candidates reviewed", len(usable)],
+            ["Carry Forward", status_counts["Carry Forward"]],
+            ["Monitor", status_counts["Monitor"]],
+            ["Pass Both Sides", status_counts["Pass Both Sides"]],
+            ["Borderline audit", borderline_summary],
+        ],
+    )
+
+
+def _stage2_recheck_focus(profile):
+    status = profile.get("status")
+    audit = profile.get("borderlinePromotionAudit") or {}
+    flags = audit.get("borderlineDowngradeFlags") or []
+    if status == "Carry Forward":
+        return "Confirm starter, lineup, weather, and price."
+    if status == "Pass Both Sides":
+        return "Only revisit after a material line or price change."
+    if "priceOutsideRange" in flags:
+        return "Needs price back inside 1.40-1.95."
+    if audit.get("stage1Group") == "BORDERLINE":
+        return "Needs promotion signal or cleaner risk profile."
+    return "Needs lineup, price, or workload confirmation."
+
+
+def _stage2_priority_recheck_table(profiles):
+    usable = [profile for profile in profiles if not profile.get("error")]
+    ordered = sorted(
+        usable,
+        key=lambda profile: {
+            "Carry Forward": 0,
+            "Monitor": 1,
+            "Blocked": 1,
+            "Pass Both Sides": 2,
+        }.get(profile.get("status"), 3),
+    )
+    return _markdown_table(
+        ["Pitcher", "Side", "Price", "Status", "Stage 1", "Adjusted Edge", "Recheck Focus"],
+        [
+            [
+                profile.get("pitcher"),
+                profile.get("bestSide"),
+                (
+                    _decimal(profile.get("overOdds"))
+                    if profile.get("bestSide") == "Over Candidate"
+                    else _decimal(profile.get("underOdds"))
+                    if profile.get("bestSide") == "Under Candidate"
+                    else "N/A"
+                ),
+                profile.get("status"),
+                (profile.get("borderlinePromotionAudit") or {}).get("stage1Group") or profile.get("stage1Group") or "UNKNOWN",
+                (
+                    f"{(profile.get('borderlinePromotionAudit') or {}).get('edgePercentagePoints'):.1f} pp"
+                    if (profile.get("borderlinePromotionAudit") or {}).get("edgePercentagePoints") is not None
+                    else "N/A"
+                ),
+                _stage2_recheck_focus(profile),
+            ]
+            for profile in ordered
+        ],
+    )
+
+
 def _stage2_report_markdown(date, profiles, parse_errors):
+    usable = [profile for profile in profiles if not profile.get("error")]
     lines = [
         "Stage 2 Pitcher-K Research",
         "",
         "Research only. No final bets yet.",
+        "",
+        "At-a-Glance",
+        "",
+        _stage2_snapshot_table(profiles),
+        "",
+        "Priority Recheck List",
+        "",
+        _stage2_priority_recheck_table(usable),
         "",
         "Bet365 Lines Read",
         "",
@@ -3844,7 +3936,6 @@ def _stage2_report_markdown(date, profiles, parse_errors):
             ]
         )
 
-    usable = [profile for profile in profiles if not profile.get("error")]
     lines.extend(
         [
             "",
