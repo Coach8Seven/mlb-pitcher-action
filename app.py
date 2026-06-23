@@ -4429,44 +4429,46 @@ def game_screening():
         rank_gap_notes,
     )
 
-    payload = {
+    requested_matchups = [
+        f"{away}@{home}" for away, home in requested
+    ]
+    slim_payload = {
         "date": date,
         "season": season,
         "screeningOnly": True,
-        "responseMode": "compact",
-        "stage1Dashboard": stage1_dashboard,
+        "responseMode": "markdown",
         "stage1ReportMarkdown": stage1_dashboard.get("stage1ReportMarkdown"),
-        "requestedMatchups": [
-            f"{away}@{home}" for away, home in requested
-        ],
+        "requestedMatchups": requested_matchups,
         "unmatchedRequestedMatchups": unmatched,
         "gamesReturned": len(screened),
-        "games": compact_games,
+        "pitchersScreened": sum(
+            1 for game in compact_games for pitcher in game.get("pitchers", []) if pitcher.get("available")
+        ),
+        "stage2ScreenshotTargets": stage1_dashboard.get("stage2ScreenshotTargets", []),
         "recommendedPitchers": compact_recommended,
-        "notSelectedPitchers": compact_not_selected,
-        "screeningGroups": compact_groups,
-        "rankGapNotes": rank_gap_notes,
         "notes": [
-            "This compact response is designed to fit a full screenshot slate in one action call.",
-            "Use stage1Dashboard for the user-facing Stage 1 report.",
-            "Use stage1ReportMarkdown exactly when the GPT needs a consistent ready-made Stage 1 report.",
+            "Default response is intentionally slim so ChatGPT actions can handle full screenshot slates reliably.",
+            "Display stage1ReportMarkdown exactly for the user-facing Stage 1 report.",
+            "Use include_details=true only when debugging or when raw dashboard data is required.",
             "This endpoint screens games for deeper pitcher-K research. It does not recommend bets.",
-            "Expected Ks is the preferred Stage 1 ranking field; the old research-priority score remains as a comparison aid.",
-            "Recommended pitchers come from the RESEARCH group, up to a maximum of 10.",
-            "Every screened pitcher is returned in screeningGroups: research, borderline, or passForNow.",
-            "Expected-K gap guide: under 0.30 = tied; 0.30-0.59 = small edge; 0.60-0.99 = meaningful edge; 1.00+ = major edge.",
-            "Use measurable screening data only. Reputation or name value is not a reason to research a pitcher.",
-            "Send only screenshot-provided matchups in the matchups query when screening a Bet365 screenshot.",
-            "Projected lineups can support research with an uncertainty haircut, but never treat projected lineups as confirmed.",
-            "Confirm lineups, injury news, weather, Bet365 pitcher-K lines, and prices before any final bet decision.",
         ],
     }
+
+    payload = slim_payload
     if include_details:
-        payload["responseMode"] = "detailed"
-        payload["debugFullGames"] = screened
-        payload["debugFullScreeningGroups"] = screening_groups
-        payload["debugFullRecommendedPitchers"] = recommended_pitchers
-        payload["debugFullNotSelectedPitchers"] = not_selected_pitchers
+        payload = {
+            **slim_payload,
+            "responseMode": "detailed",
+            "stage1Dashboard": stage1_dashboard,
+            "games": compact_games,
+            "notSelectedPitchers": compact_not_selected,
+            "screeningGroups": compact_groups,
+            "rankGapNotes": rank_gap_notes,
+            "debugFullGames": screened,
+            "debugFullScreeningGroups": screening_groups,
+            "debugFullRecommendedPitchers": recommended_pitchers,
+            "debugFullNotSelectedPitchers": not_selected_pitchers,
+        }
 
     return jsonify(payload)
 
