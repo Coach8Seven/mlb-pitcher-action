@@ -11,6 +11,29 @@ from flask import Flask, jsonify, request
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
 ATLANTIC_TZ = ZoneInfo("America/Moncton")
+BORDERLINE_RULES = {
+    "minimumRecentStartsForNormalConfidence": 8,
+    "smallSampleThreshold": 5,
+    "limitedSampleThreshold": 8,
+    "shortPriceCutoff": 1.60,
+    "mediumPriceCutoff": 1.75,
+    "minimumPrice": 1.40,
+    "maximumPrice": 1.95,
+    "thinGap": 0.30,
+    "meaningfulGap": 0.60,
+    "strongGap": 1.00,
+    "fullLineMove": 1.00,
+    "halfLineMove": 0.50,
+    "minimumIndependentSignals": 2,
+    "minimumEdgePercentagePoints": 2.0,
+    "smallSamplePenalty": 0.12,
+    "limitedSamplePenalty": 0.07,
+    "projectedLineupPenalty": 0.03,
+    "staleDataPenalty": 0.03,
+    "pitchQualityUnavailablePenalty": 0.04,
+    "weakPitchQualityPenalty": 0.05,
+    "thinPricePenalty": 0.04,
+}
 
 app = Flask(__name__)
 
@@ -2691,6 +2714,14 @@ def _parse_stage2_candidates(raw):
                 }
             )
             continue
+        stage1_group = _normalize_stage1_group(parts[6] if len(parts) > 6 else None)
+        original_line = _float(parts[7]) if len(parts) > 7 and parts[7] else line
+        original_over_odds = (
+            _float(parts[8]) if len(parts) > 8 and parts[8] else over_odds
+        )
+        original_under_odds = (
+            _float(parts[9]) if len(parts) > 9 and parts[9] else under_odds
+        )
         candidates.append(
             {
                 "pitcher": parts[0],
@@ -2699,10 +2730,23 @@ def _parse_stage2_candidates(raw):
                 "line": line,
                 "overOdds": over_odds,
                 "underOdds": under_odds,
+                "stage1Group": stage1_group,
+                "originalLine": original_line,
+                "originalOverOdds": original_over_odds,
+                "originalUnderOdds": original_under_odds,
                 "readStatus": "Readable",
             }
         )
     return candidates, errors
+
+
+def _normalize_stage1_group(value):
+    normalized = str(value or "").strip().upper().replace(" ", "_")
+    if normalized in {"RESEARCH", "BORDERLINE", "UNKNOWN"}:
+        return normalized
+    if normalized in {"PASS", "PASS_FOR_NOW", "PASS-FOR-NOW"}:
+        return "UNKNOWN"
+    return "UNKNOWN"
 
 
 def _normalize_matchup(value):
@@ -2911,6 +2955,490 @@ def _stage2_pitch_quality(person_id, start_splits, sample=3):
     }
 
 
+def _fraction_hits(value):
+    text = str(value or "0/0").split(",")[0].strip()
+    hits, separator, sample = text.partition("/")
+    if not separator:
+        return 0, 0, None
+    hit_count = _num(hits, 0)
+    sample_count = _num(sample, 0)
+    rate = round(hit_count / sample_count, 3) if sample_count else None
+    return hit_count, sample_count, rate
+
+
+def _sample_size_grade(recent):
+    sample = len(recent.get("starts", []))
+    if sample < BORDERLINE_RULES["smallSampleThreshold"]:
+        return "Small"
+    if sample < BORDERLINE_RULES["limitedSampleThreshold"]:
+        return "Limited"
+    return "Normal"
+
+
+def _projection_gap_grade(gap):
+    if gap is None:
+        return "unavailable"
+    if gap < BORDERLINE_RULES["thinGap"]:
+        return "thin"
+    if gap < BORDERLINE_RULES["meaningfulGap"]:
+        return "small"
+    if gap < BORDERLINE_RULES["strongGap"]:
+        return "meaningful"
+    return "strong"
+
+
+def _workload_confidence_grade(recent):
+    starts = len(recent.get("starts", []))
+    last5 = recent.get("last5", {})
+    avg_pitches = last5.get("averagePitches")
+    avg_bf = last5.get("averageBattersFaced")
+    if starts >= 8 and avg_pitches is not None and avg_pitches >= 92 and avg_bf is not None and avg_bf >= 23:
+        return "High"
+    if starts >= 5 and avg_pitches is not None and avg_pitches >= 86 and avg_bf is not None and avg_bf >= 21:
+        return "Medium+"
+    if starts >= 5:
+        return "Medium"
+    return "Low"
+
+
+def _useful_whiff_pitch(pitch):
+    usage = pitch.get("sampleUsage")
+    whiff = pitch.get("sampleWhiffRate")
+    csw = pitch.get("sampleCalledStrikeWhiffRate")
+    if usage is not None and usage < 0.08:
+        return False
+    return (whiff is not None and whiff >= 0.12) or (csw is not None and csw >= 0.28)
+
+
+def _breaking_pitch(code):
+    return code in {"SL", "ST", "SV", "CU", "KC", "CS", "FS"}
+
+
+def _pitch_quality_grades(pitch_quality, side):
+    if not pitch_quality or not pitch_quality.get("available"):
+        return {
+            "pitchWhiffGrade": "Unavailable",
+            "velocityTrendGrade": "Unavailable",
+            "signals": [],
+            "flags": ["singleSourceCriticalData"],
+        }
+
+    pitches = pitch_quality.get("compactPitches") or []
+    useful = [pitch for pitch in pitches if _useful_whiff_pitch(pitch)]
+    swing_miss_pitch = pitch_quality.get("swingMissPitch") or {}
+    fastball = pitch_quality.get("fastball") or {}
+    velocity_change = fastball.get("velocityChangeLatestVsSample")
+    breaking_usage_up = any(
+        _breaking_pitch(pitch.get("code"))
+        and pitch.get("usageChangeLatestVsSample") is not None
+        and pitch.get("usageChangeLatestVsSample") >= 0.08
+        for pitch in pitches
+    )
+
+    flags = []
+    signals = []
+    if len(useful) >= 2:
+        whiff_grade = "Strong"
+    elif len(useful) == 1:
+        whiff_grade = "Adequate"
+        if side == "over":
+            flags.append("singlePitchDependency")
+    else:
+        whiff_grade = "Weak"
+        flags.append("noReliableWhiffPitch")
+
+    if velocity_change is None:
+        velocity_grade = "Unavailable"
+    elif velocity_change <= -1.0:
+        velocity_grade = "Down"
+        if side == "over":
+            flags.append("velocityDrop")
+        else:
+            signals.append("decliningVelocitySupportsUnder")
+    elif velocity_change >= 1.0:
+        velocity_grade = "Up"
+        if side == "under":
+            flags.append("recentVelocitySpikeAgainstUnder")
+        else:
+            signals.append("stableOrImprovingVelocity")
+    else:
+        velocity_grade = "Stable"
+        if side == "over":
+            signals.append("stableOrImprovingVelocity")
+
+    if side == "over":
+        if whiff_grade in {"Strong", "Adequate"}:
+            signals.append("supportivePitchQualityUpdate")
+    else:
+        if whiff_grade in {"Strong", "Adequate"}:
+            flags.append("strongWhiffQualityAgainstUnder")
+        if breaking_usage_up:
+            flags.append("breakingBallUsageIncreaseAgainstUnder")
+        elif whiff_grade == "Weak" or "velocityDrop" in flags or "decliningVelocitySupportsUnder" in signals:
+            signals.append("supportivePitchQualityUpdate")
+
+    if pitch_quality.get("startsTracked", 0) < 3:
+        flags.append("singleSourceCriticalData")
+
+    return {
+        "pitchWhiffGrade": whiff_grade,
+        "velocityTrendGrade": velocity_grade,
+        "signals": sorted(set(signals)),
+        "flags": sorted(set(flags)),
+        "usefulWhiffPitchCount": len(useful),
+        "bestWhiffPitch": _pitch_name(swing_miss_pitch),
+    }
+
+
+def _movement_grades(candidate, side):
+    line = candidate.get("line")
+    original_line = candidate.get("originalLine", line)
+    line_delta = (
+        round(line - original_line, 1)
+        if line is not None and original_line is not None
+        else None
+    )
+    current_price = candidate.get("overOdds") if side == "over" else candidate.get("underOdds")
+    original_price = (
+        candidate.get("originalOverOdds")
+        if side == "over"
+        else candidate.get("originalUnderOdds")
+    )
+    if original_price is None:
+        original_price = current_price
+    price_delta = (
+        round(current_price - original_price, 2)
+        if current_price is not None and original_price is not None
+        else None
+    )
+
+    line_grade = "none"
+    if line_delta is not None:
+        if side == "over" and line_delta <= -BORDERLINE_RULES["fullLineMove"]:
+            line_grade = "favorableFullLineMove"
+        elif side == "under" and line_delta >= BORDERLINE_RULES["fullLineMove"]:
+            line_grade = "favorableFullLineMove"
+        elif side == "over" and line_delta <= -BORDERLINE_RULES["halfLineMove"]:
+            line_grade = "favorableHalfLineMove"
+        elif side == "under" and line_delta >= BORDERLINE_RULES["halfLineMove"]:
+            line_grade = "favorableHalfLineMove"
+        elif side == "over" and line_delta >= BORDERLINE_RULES["halfLineMove"]:
+            line_grade = "adverseLineMovement"
+        elif side == "under" and line_delta <= -BORDERLINE_RULES["halfLineMove"]:
+            line_grade = "adverseLineMovement"
+
+    price_grade = "none"
+    if price_delta is not None:
+        if not _odds_in_range(original_price) and _odds_in_range(current_price):
+            price_grade = "movedIntoRange"
+        elif price_delta >= 0.08:
+            price_grade = "betterPrice"
+        elif price_delta <= -0.08:
+            price_grade = "adversePriceMovement"
+
+    movement = "No material line or price movement."
+    if line_grade == "favorableFullLineMove":
+        movement = "Favorable full-line movement; re-evaluate as a changed market."
+    elif line_grade == "favorableHalfLineMove":
+        movement = "Favorable half-line movement; positive but not enough by itself."
+    elif line_grade == "adverseLineMovement":
+        movement = "Adverse line movement."
+    elif price_grade == "movedIntoRange":
+        movement = "Desired side price moved into range."
+    elif price_grade == "betterPrice":
+        movement = "Desired side price improved."
+    elif price_grade == "adversePriceMovement":
+        movement = "Desired side price shortened; value may be reduced."
+
+    return {
+        "originalLine": original_line,
+        "currentLine": line,
+        "lineDelta": line_delta,
+        "originalSidePrice": original_price,
+        "currentSidePrice": current_price,
+        "priceDelta": price_delta,
+        "lineMovementGrade": line_grade,
+        "priceMovementGrade": price_grade,
+        "movementInterpretation": movement,
+    }
+
+
+def _price_required_gap(price):
+    if price is None:
+        return BORDERLINE_RULES["strongGap"]
+    if price < BORDERLINE_RULES["shortPriceCutoff"]:
+        return BORDERLINE_RULES["strongGap"]
+    if price < BORDERLINE_RULES["mediumPriceCutoff"]:
+        return BORDERLINE_RULES["meaningfulGap"]
+    return BORDERLINE_RULES["thinGap"]
+
+
+def _uncertainty_penalty(sample_grade, pitch_grade, flags):
+    penalty = 0.0
+    if sample_grade == "Small":
+        penalty += BORDERLINE_RULES["smallSamplePenalty"]
+    elif sample_grade == "Limited":
+        penalty += BORDERLINE_RULES["limitedSamplePenalty"]
+    if pitch_grade == "Unavailable":
+        penalty += BORDERLINE_RULES["pitchQualityUnavailablePenalty"]
+    elif pitch_grade == "Weak":
+        penalty += BORDERLINE_RULES["weakPitchQualityPenalty"]
+    if "projectedLineupOnly" in flags:
+        penalty += BORDERLINE_RULES["projectedLineupPenalty"]
+    if "staleData" in flags:
+        penalty += BORDERLINE_RULES["staleDataPenalty"]
+    if "shortPriceThinEdge" in flags:
+        penalty += BORDERLINE_RULES["thinPricePenalty"]
+    return round(min(penalty, 0.35), 3)
+
+
+def _side_stage2_evaluation(candidate, expected_ks, recent, pitch_quality, side):
+    line = candidate.get("line")
+    price = candidate.get("overOdds") if side == "over" else candidate.get("underOdds")
+    projection_gap = None
+    if expected_ks is not None and line is not None:
+        projection_gap = round(expected_ks - line, 1) if side == "over" else round(line - expected_ks, 1)
+    projection_grade = _projection_gap_grade(projection_gap)
+    sample_grade = _sample_size_grade(recent)
+    sample = len(recent.get("starts", []))
+    last10 = recent.get("last10", {})
+    hit_text = last10.get("over") if side == "over" else last10.get("under")
+    _, _, hit_rate = _fraction_hits(hit_text)
+    pitch_grades = _pitch_quality_grades(pitch_quality, side)
+    movement = _movement_grades(candidate, side)
+    workload_confidence = _workload_confidence_grade(recent)
+
+    flags = set(pitch_grades.get("flags") or [])
+    signals = set(pitch_grades.get("signals") or [])
+    critical_blockers = set()
+
+    if sample == 0:
+        flags.add("unverifiedRecentStarts")
+        critical_blockers.add("unverifiedRecentStarts")
+    elif sample < BORDERLINE_RULES["smallSampleThreshold"]:
+        flags.add("fewerThanFiveRecentStarts")
+    elif sample < BORDERLINE_RULES["minimumRecentStartsForNormalConfidence"]:
+        flags.add("incompleteLastTen")
+
+    if not _odds_in_range(price):
+        flags.add("priceOutsideRange")
+        critical_blockers.add("priceOutsideRange")
+    if movement["lineMovementGrade"] == "adverseLineMovement":
+        flags.add("adverseLineMovement")
+    if movement["priceMovementGrade"] == "adversePriceMovement":
+        flags.add("adversePriceMovement")
+
+    if price is not None and price < BORDERLINE_RULES["shortPriceCutoff"]:
+        if projection_gap is None or projection_gap < BORDERLINE_RULES["strongGap"]:
+            flags.add("shortPriceThinEdge")
+        if workload_confidence != "High":
+            flags.add("workloadUncertainty")
+        if side == "over" and pitch_grades["pitchWhiffGrade"] != "Strong":
+            flags.add("noReliableWhiffPitch")
+
+    if side == "over":
+        if workload_confidence in {"High", "Medium+"}:
+            signals.add("strongerWorkloadConfirmation")
+        elif workload_confidence == "Low":
+            flags.add("workloadUncertainty")
+    else:
+        if workload_confidence == "Low":
+            signals.add("workloadUncertaintySupportsUnder")
+        elif workload_confidence == "High":
+            flags.add("strongOutsProjectionAgainstUnder")
+
+    if movement["lineMovementGrade"] == "favorableFullLineMove":
+        signals.add("favorableFullLineMovement")
+    elif movement["lineMovementGrade"] == "favorableHalfLineMove":
+        signals.add("favorableHalfLineMovement")
+    if movement["priceMovementGrade"] == "movedIntoRange":
+        signals.add("favorablePriceImprovement")
+    elif movement["priceMovementGrade"] == "betterPrice":
+        signals.add("betterPrice")
+
+    if projection_gap is not None and projection_gap >= _price_required_gap(price):
+        signals.add("meaningfulProjectionEdge")
+
+    implied_probability = (round(1 / price, 3) if price else None)
+    raw_estimated = None
+    if projection_gap is not None:
+        hit_component = (hit_rate - 0.5) * 0.16 if hit_rate is not None else 0
+        if side == "over":
+            workload_component = 0.03 if workload_confidence == "High" else 0.015 if workload_confidence == "Medium+" else -0.02 if workload_confidence == "Low" else 0
+            pitch_component = 0.03 if pitch_grades["pitchWhiffGrade"] == "Strong" else 0.015 if pitch_grades["pitchWhiffGrade"] == "Adequate" else -0.03 if pitch_grades["pitchWhiffGrade"] == "Weak" else -0.015
+        else:
+            workload_component = 0.025 if workload_confidence == "Low" else -0.025 if workload_confidence == "High" else 0
+            pitch_component = 0.03 if pitch_grades["pitchWhiffGrade"] == "Weak" else -0.03 if pitch_grades["pitchWhiffGrade"] == "Strong" else -0.015 if pitch_grades["pitchWhiffGrade"] == "Adequate" else 0
+        raw_estimated = round(
+            _clamp(0.50 + projection_gap * 0.075 + hit_component + workload_component + pitch_component, 0.20, 0.82),
+            3,
+        )
+    penalty = _uncertainty_penalty(sample_grade, pitch_grades["pitchWhiffGrade"], flags)
+    adjusted = (
+        round(_clamp(raw_estimated - penalty, 0.05, 0.90), 3)
+        if raw_estimated is not None
+        else None
+    )
+    edge_points = (
+        round((adjusted - implied_probability) * 100, 1)
+        if adjusted is not None and implied_probability is not None
+        else None
+    )
+    adjusted_true_odds = round(1 / adjusted, 2) if adjusted else None
+    adjusted_edge_qualifies = (
+        edge_points is not None
+        and edge_points >= BORDERLINE_RULES["minimumEdgePercentagePoints"]
+    )
+    gap_qualifies = projection_gap is not None and projection_gap >= _price_required_gap(price)
+
+    if sample_grade == "Small" and len(signals - {"meaningfulProjectionEdge"}) < 2:
+        flags.add("smallSampleNeedsIndependentSignals")
+
+    return {
+        "side": side,
+        "stage1Group": candidate.get("stage1Group", "UNKNOWN"),
+        "recentStartSample": sample,
+        "sampleSizeGrade": sample_grade,
+        "projectionGap": projection_gap,
+        "projectionGapGrade": projection_grade,
+        "pitchWhiffGrade": pitch_grades["pitchWhiffGrade"],
+        "velocityTrendGrade": pitch_grades["velocityTrendGrade"],
+        "workloadConfidence": workload_confidence,
+        "lineupImpactGrade": "Unavailable",
+        "uncertaintyPenalty": penalty,
+        "borderlinePromotionSignals": sorted(signals),
+        "borderlineDowngradeFlags": sorted(flags),
+        "criticalBlockers": sorted(critical_blockers),
+        "impliedProbability": implied_probability,
+        "rawEstimatedTrueProbability": raw_estimated,
+        "uncertaintyHaircut": penalty,
+        "adjustedEstimatedTrueProbability": adjusted,
+        "edgePercentagePoints": edge_points,
+        "adjustedTrueOdds": adjusted_true_odds,
+        "adjustedEdgeQualifies": adjusted_edge_qualifies,
+        "gapQualifies": gap_qualifies,
+        **movement,
+    }
+
+
+def _promotion_reason(evaluation, decision):
+    blockers = evaluation.get("criticalBlockers") or []
+    flags = evaluation.get("borderlineDowngradeFlags") or []
+    signals = evaluation.get("borderlinePromotionSignals") or []
+    if decision == "Promoted":
+        return "Promotion gate passed: adjusted edge qualifies with independent support from " + ", ".join(signals[:3]) + "."
+    if blockers:
+        return "Critical blocker: " + ", ".join(blockers[:3]) + "."
+    if decision == "Monitor":
+        return "Directional interest remains, but promotion gate is incomplete."
+    if flags:
+        return "Rejected by downgrade flags: " + ", ".join(flags[:3]) + "."
+    return "Rejected because adjusted edge or independent support is not strong enough."
+
+
+def _borderline_promotion_audit(candidate, expected_ks, recent, pitch_quality, existing_decision):
+    side_evaluations = {
+        "over": _side_stage2_evaluation(candidate, expected_ks, recent, pitch_quality, "over"),
+        "under": _side_stage2_evaluation(candidate, expected_ks, recent, pitch_quality, "under"),
+    }
+    ranked = sorted(
+        side_evaluations.values(),
+        key=lambda item: (
+            item.get("edgePercentagePoints") if item.get("edgePercentagePoints") is not None else -999,
+            item.get("projectionGap") if item.get("projectionGap") is not None else -999,
+        ),
+        reverse=True,
+    )
+    best = ranked[0]
+    stage1_group = candidate.get("stage1Group", "UNKNOWN")
+    material_signals = [
+        signal
+        for signal in best.get("borderlinePromotionSignals", [])
+        if signal not in {"favorableHalfLineMovement", "betterPrice"}
+    ]
+    blockers = best.get("criticalBlockers") or []
+    flags = best.get("borderlineDowngradeFlags") or []
+
+    if stage1_group != "BORDERLINE":
+        decision = "Not Applicable"
+    elif blockers:
+        decision = "Rejected"
+    elif (
+        best.get("adjustedEdgeQualifies")
+        and best.get("gapQualifies")
+        and len(material_signals) >= 1
+        and len(best.get("borderlinePromotionSignals", [])) >= BORDERLINE_RULES["minimumIndependentSignals"]
+        and "smallSampleNeedsIndependentSignals" not in flags
+    ):
+        decision = "Promoted"
+    elif best.get("projectionGap") is not None and best.get("projectionGap") >= BORDERLINE_RULES["thinGap"] and not blockers:
+        decision = "Monitor"
+    else:
+        decision = "Rejected"
+
+    reason = _promotion_reason(best, decision)
+    return {
+        "stage1Group": stage1_group,
+        "bestSide": "Over Candidate" if best.get("side") == "over" else "Under Candidate",
+        "sideEvaluations": side_evaluations,
+        "recentStartSample": best.get("recentStartSample"),
+        "sampleSizeGrade": best.get("sampleSizeGrade"),
+        "projectionGap": best.get("projectionGap"),
+        "projectionGapGrade": best.get("projectionGapGrade"),
+        "pitchWhiffGrade": best.get("pitchWhiffGrade"),
+        "velocityTrendGrade": best.get("velocityTrendGrade"),
+        "workloadConfidence": best.get("workloadConfidence"),
+        "lineMovementGrade": best.get("lineMovementGrade"),
+        "priceMovementGrade": best.get("priceMovementGrade"),
+        "lineupImpactGrade": best.get("lineupImpactGrade"),
+        "uncertaintyPenalty": best.get("uncertaintyPenalty"),
+        "borderlinePromotionSignals": best.get("borderlinePromotionSignals"),
+        "borderlineDowngradeFlags": best.get("borderlineDowngradeFlags"),
+        "criticalBlockers": best.get("criticalBlockers"),
+        "borderlinePromotionDecision": decision,
+        "borderlinePromotionReason": reason,
+        "impliedProbability": best.get("impliedProbability"),
+        "rawEstimatedTrueProbability": best.get("rawEstimatedTrueProbability"),
+        "uncertaintyHaircut": best.get("uncertaintyHaircut"),
+        "adjustedEstimatedTrueProbability": best.get("adjustedEstimatedTrueProbability"),
+        "edgePercentagePoints": best.get("edgePercentagePoints"),
+        "adjustedTrueOdds": best.get("adjustedTrueOdds"),
+        "originalLine": best.get("originalLine"),
+        "currentLine": best.get("currentLine"),
+        "lineDelta": best.get("lineDelta"),
+        "originalSidePrice": best.get("originalSidePrice"),
+        "currentSidePrice": best.get("currentSidePrice"),
+        "priceDelta": best.get("priceDelta"),
+        "movementInterpretation": best.get("movementInterpretation"),
+    }
+
+
+def _stage2_decision_with_borderline_gate(candidate, decision, promotion_audit):
+    if candidate.get("stage1Group") != "BORDERLINE":
+        return decision
+    promotion_decision = promotion_audit.get("borderlinePromotionDecision")
+    if promotion_decision == "Promoted":
+        return {
+            "bestSide": promotion_audit.get("bestSide"),
+            "status": "Carry Forward",
+            "reason": promotion_audit.get("borderlinePromotionReason"),
+            "gap": promotion_audit.get("projectionGap"),
+        }
+    if promotion_decision == "Monitor":
+        return {
+            "bestSide": promotion_audit.get("bestSide"),
+            "status": "Monitor",
+            "reason": promotion_audit.get("borderlinePromotionReason"),
+            "gap": promotion_audit.get("projectionGap"),
+        }
+    return {
+        "bestSide": promotion_audit.get("bestSide"),
+        "status": "Pass Both Sides",
+        "reason": promotion_audit.get("borderlinePromotionReason"),
+        "gap": promotion_audit.get("projectionGap"),
+    }
+
+
 def _stage2_decision(candidate, expected_ks, summary):
     line = candidate.get("line")
     over_odds = candidate.get("overOdds")
@@ -3011,6 +3539,23 @@ def _stage2_candidate_profile(candidate, season, games_by_matchup, date, include
         recent_splits,
     )
     decision = _stage2_decision(candidate, expected_ks, recent)
+    pitch_quality = (
+        _stage2_pitch_quality(pitcher["id"], recent_splits)
+        if include_pitch_quality
+        else None
+    )
+    promotion_audit = _borderline_promotion_audit(
+        candidate,
+        expected_ks,
+        recent,
+        pitch_quality,
+        decision,
+    )
+    decision = _stage2_decision_with_borderline_gate(
+        candidate,
+        decision,
+        promotion_audit,
+    )
     return {
         "candidate": candidate,
         "pitcherId": pitcher["id"],
@@ -3021,6 +3566,10 @@ def _stage2_candidate_profile(candidate, season, games_by_matchup, date, include
         "line": candidate.get("line"),
         "overOdds": candidate.get("overOdds"),
         "underOdds": candidate.get("underOdds"),
+        "stage1Group": candidate.get("stage1Group", "UNKNOWN"),
+        "originalLine": candidate.get("originalLine"),
+        "originalOverOdds": candidate.get("originalOverOdds"),
+        "originalUnderOdds": candidate.get("originalUnderOdds"),
         "expectedStrikeouts": expected_ks,
         "expectedBattersFaced": expected_bf,
         "estimatedKRate": estimated_k_rate,
@@ -3029,11 +3578,8 @@ def _stage2_candidate_profile(candidate, season, games_by_matchup, date, include
         "status": decision.get("status"),
         "reason": decision.get("reason"),
         "recent": recent,
-        "pitchQuality": (
-            _stage2_pitch_quality(pitcher["id"], recent_splits)
-            if include_pitch_quality
-            else None
-        ),
+        "pitchQuality": pitch_quality,
+        "borderlinePromotionAudit": promotion_audit,
         "error": None,
     }
 
@@ -3108,6 +3654,23 @@ def _stage2_pitch_quality_row(profile):
     ]
 
 
+def _stage2_borderline_audit_row(profile):
+    audit = profile.get("borderlinePromotionAudit") or {}
+    signals = audit.get("borderlinePromotionSignals") or []
+    flags = audit.get("borderlineDowngradeFlags") or []
+    edge = audit.get("edgePercentagePoints")
+    return [
+        profile.get("pitcher"),
+        audit.get("stage1Group") or profile.get("stage1Group") or "UNKNOWN",
+        audit.get("bestSide") or profile.get("bestSide"),
+        ", ".join(signals) if signals else "None",
+        ", ".join(flags) if flags else "None",
+        f"{edge:.1f} pp" if edge is not None else "N/A",
+        audit.get("borderlinePromotionDecision") or "Not Applicable",
+        audit.get("borderlinePromotionReason") or "N/A",
+    ]
+
+
 def _stage2_compact_profile(profile):
     if profile.get("error"):
         candidate = profile.get("candidate", {})
@@ -3122,6 +3685,7 @@ def _stage2_compact_profile(profile):
     quality = profile.get("pitchQuality") or {}
     whiff_pitch = quality.get("swingMissPitch") or {}
     fastball = quality.get("fastball") or {}
+    audit = profile.get("borderlinePromotionAudit") or {}
     return {
         "pitcher": profile.get("pitcher"),
         "team": profile.get("team"),
@@ -3130,6 +3694,39 @@ def _stage2_compact_profile(profile):
         "line": profile.get("line"),
         "overOdds": profile.get("overOdds"),
         "underOdds": profile.get("underOdds"),
+        "stage1Group": profile.get("stage1Group"),
+        "recentStartSample": audit.get("recentStartSample"),
+        "sampleSizeGrade": audit.get("sampleSizeGrade"),
+        "projectionGap": audit.get("projectionGap"),
+        "projectionGapGrade": audit.get("projectionGapGrade"),
+        "pitchWhiffGrade": audit.get("pitchWhiffGrade"),
+        "velocityTrendGrade": audit.get("velocityTrendGrade"),
+        "workloadConfidence": audit.get("workloadConfidence"),
+        "lineMovementGrade": audit.get("lineMovementGrade"),
+        "priceMovementGrade": audit.get("priceMovementGrade"),
+        "lineupImpactGrade": audit.get("lineupImpactGrade"),
+        "uncertaintyPenalty": audit.get("uncertaintyPenalty"),
+        "borderlinePromotionSignals": audit.get("borderlinePromotionSignals"),
+        "borderlineDowngradeFlags": audit.get("borderlineDowngradeFlags"),
+        "borderlinePromotionDecision": audit.get("borderlinePromotionDecision"),
+        "borderlinePromotionReason": audit.get("borderlinePromotionReason"),
+        "priceMath": {
+            "impliedProbability": audit.get("impliedProbability"),
+            "rawEstimatedTrueProbability": audit.get("rawEstimatedTrueProbability"),
+            "uncertaintyHaircut": audit.get("uncertaintyHaircut"),
+            "adjustedEstimatedTrueProbability": audit.get("adjustedEstimatedTrueProbability"),
+            "edgePercentagePoints": audit.get("edgePercentagePoints"),
+            "adjustedTrueOdds": audit.get("adjustedTrueOdds"),
+        },
+        "movement": {
+            "originalLine": audit.get("originalLine"),
+            "currentLine": audit.get("currentLine"),
+            "lineDelta": audit.get("lineDelta"),
+            "originalSidePrice": audit.get("originalSidePrice"),
+            "currentSidePrice": audit.get("currentSidePrice"),
+            "priceDelta": audit.get("priceDelta"),
+            "movementInterpretation": audit.get("movementInterpretation"),
+        },
         "expectedStrikeouts": profile.get("expectedStrikeouts"),
         "gapVsLine": profile.get("gapVsLine"),
         "bestSide": profile.get("bestSide"),
@@ -3261,6 +3858,22 @@ def _stage2_report_markdown(date, profiles, parse_errors):
                     "Reason",
                 ],
                 [_stage2_side_row(profile) for profile in usable],
+            ),
+            "",
+            "Borderline Promotion Audit",
+            "",
+            _markdown_table(
+                [
+                    "Pitcher",
+                    "Stage 1 Group",
+                    "Best Side",
+                    "Positive Signals",
+                    "Downgrade Flags",
+                    "Adjusted Edge",
+                    "Promotion Decision",
+                    "Reason",
+                ],
+                [_stage2_borderline_audit_row(profile) for profile in usable],
             ),
             "",
             "Pitch Mix / Velocity Check",
@@ -4030,7 +4643,7 @@ def stage2_research():
         "stage": "Stage 2",
         "screeningOnly": True,
         "responseMode": "compact",
-        "inputFormat": "Pitcher|Team|Matchup|Line|OverOdds|UnderOdds;...",
+        "inputFormat": "Pitcher|Team|Matchup|Line|OverOdds|UnderOdds[|Stage1Group|OriginalLine|OriginalOverOdds|OriginalUnderOdds];...",
         "candidatesReturned": len(profiles),
         "parseErrors": parse_errors,
         "profiles": [_stage2_compact_profile(profile) for profile in profiles],
@@ -4041,6 +4654,7 @@ def stage2_research():
             "The report is research only. It does not make final bet recommendations.",
             "Actual last 10 starts are shown for every readable candidate, with Last 5 marked.",
             "Pitch mix and velocity are compact checks from recent pitch-level MLB Stats API data when include_pitch_quality=true.",
+            "Optional Stage1Group metadata activates the stricter BORDERLINE promotion gate; missing metadata defaults to UNKNOWN.",
             "Stage 2 ends by asking for the user's next available recheck time.",
         ],
     }
