@@ -2137,8 +2137,8 @@ def _outs_stage1_dashboard(date, requested, unmatched, compact_games, compact_gr
     ]
     what_next = [
         "No bets yet.",
-        "Approve, remove, or adjust the Stage 2 Screenshot Targets before Stage 2.",
-        "Send Bet365 pitcher-outs screenshots for the Stage 2 Screenshot Targets first.",
+        "Approve, remove, or adjust the Top 10 Stage 2 Screenshot Targets before Stage 2.",
+        "Send Bet365 pitcher-outs screenshots for the Top 10 targets first.",
     ]
     if not research_rows:
         what_next.append("No RESEARCH pitchers cleared the screen. Consider No Bet Day or ask about BORDERLINE soft-line checks.")
@@ -2152,8 +2152,11 @@ def _outs_stage1_dashboard(date, requested, unmatched, compact_games, compact_gr
         }
         for row in research_rows[:10]
     ]
+    research_not_targeted = research_rows[10:]
+    if research_not_targeted:
+        what_next.append("Research ranks 11+ are lower-priority backups; do not screenshot them unless you want extra coverage after the Top 10.")
     borderline_option = (
-        "Optional: include BORDERLINE pitchers only if you want to check for unusually soft Bet365 outs lines."
+        "BORDERLINE pitchers are price-discovery only. Skip them for now unless you explicitly ask to review soft lines."
         if borderline_rows
         else None
     )
@@ -2177,6 +2180,8 @@ def _outs_stage1_dashboard(date, requested, unmatched, compact_games, compact_gr
         },
         "unavailablePitchers": _unavailable_pitchers(compact_games),
         "stage2ScreenshotTargets": stage2_targets,
+        "stage2TargetSelectionNote": "Top 10 targets are chosen from RESEARCH only, ordered by expected outs. Pitchers within 0.75 expected outs are ordered by workload tie-breakers: workload confidence, recent outs, recent pitch count, and stability.",
+        "researchNotTargetedYet": research_not_targeted,
         "borderlineOption": borderline_option,
         "whatINeedNext": what_next,
         "displayRules": [
@@ -2245,13 +2250,42 @@ def _outs_stage1_report_markdown(dashboard):
         lines.extend(
             [
                 "",
-                "Stage 2 Screenshot Targets",
+                "Top 10 Stage 2 Screenshot Targets",
+                "",
+                dashboard.get("stage2TargetSelectionNote") or "Top targets are selected from the RESEARCH group.",
                 "",
                 _markdown_table(
                     ["Rank", "Pitcher", "Team", "Matchup", "Game Time"],
                     [
                         [target.get("rank"), target.get("pitcher"), target.get("team"), target.get("matchup"), target.get("gameTime")]
                         for target in targets
+                    ],
+                ),
+            ]
+        )
+    backups = dashboard.get("researchNotTargetedYet") or []
+    if backups:
+        lines.extend(
+            [
+                "",
+                "Research But Not Targeted Yet",
+                "",
+                "These pitchers cleared RESEARCH, but they are outside the first screenshot batch after expected-outs and workload tie-breakers. Keep them as backups, not priority screenshots.",
+                "",
+                _markdown_table(
+                    ["Research Rank", "Pitcher", "Team", "Matchup", "Game Time", "Exp Outs", "Workload Confidence", "Why Not First Batch"],
+                    [
+                        [
+                            row.get("rank"),
+                            row.get("pitcher"),
+                            row.get("team"),
+                            row.get("matchup"),
+                            row.get("gameTime"),
+                            row.get("expOuts"),
+                            row.get("workloadConfidence"),
+                            "Lower than Top 10 after expected-outs/workload ordering.",
+                        ]
+                        for row in backups
                     ],
                 ),
             ]
