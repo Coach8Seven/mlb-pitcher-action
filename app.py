@@ -4541,48 +4541,54 @@ def out_screening():
         rank_gap_notes,
     )
 
-    payload = {
+    requested_matchups = [
+        f"{away}@{home}" for away, home in requested
+    ]
+    compact_recommended = [
+        _compact_out_pitcher(pitcher)
+        for pitcher in recommended_pitchers
+    ]
+    compact_not_selected = [
+        _compact_out_pitcher(pitcher)
+        for pitcher in not_selected_pitchers
+    ]
+    slim_payload = {
         "date": date,
         "season": season,
         "screeningOnly": True,
-        "responseMode": "compact",
-        "outsStage1Dashboard": outs_stage1_dashboard,
+        "responseMode": "markdown",
         "outsStage1ReportMarkdown": outs_stage1_dashboard.get("outsStage1ReportMarkdown"),
-        "requestedMatchups": [
-            f"{away}@{home}" for away, home in requested
-        ],
+        "requestedMatchups": requested_matchups,
         "unmatchedRequestedMatchups": unmatched,
         "gamesReturned": len(screened),
-        "games": compact_games,
-        "recommendedPitchers": [
-            _compact_out_pitcher(pitcher)
-            for pitcher in recommended_pitchers
-        ],
-        "notSelectedPitchers": [
-            _compact_out_pitcher(pitcher)
-            for pitcher in not_selected_pitchers
-        ],
-        "outScreeningGroups": compact_groups,
-        "rankGapNotes": rank_gap_notes,
+        "pitchersScreened": sum(
+            1 for game in compact_games for pitcher in game.get("pitchers", []) if pitcher.get("available")
+        ),
+        "stage2ScreenshotTargets": outs_stage1_dashboard.get("stage2ScreenshotTargets", []),
+        "recommendedPitchers": compact_recommended,
         "notes": [
+            "Default response is intentionally slim so ChatGPT actions can handle full screenshot slates reliably.",
+            "Display outsStage1ReportMarkdown exactly for the user-facing Stage 1 report.",
+            "Use include_details=true only when debugging or when raw dashboard data is required.",
             "This endpoint screens games for deeper pitcher-outs research. It does not recommend bets.",
-            "Use outsStage1Dashboard for the user-facing Stage 1 report.",
-            "Use outsStage1ReportMarkdown exactly when the GPT needs a consistent ready-made Stage 1 report.",
-            "Expected Outs is the preferred Stage 1 ranking field.",
-            "Recommended pitchers come from the RESEARCH group, up to a maximum of 10.",
-            "Every screened pitcher is returned in outScreeningGroups: research, borderline, or passForNow.",
-            "Use measurable workload data only. Reputation or name value is not a reason to research a pitcher.",
-            "Send only screenshot-provided matchups in the matchups query when screening a Bet365 screenshot.",
-            "Projected lineups can support research with an uncertainty haircut, but never treat projected lineups as confirmed.",
-            "Confirm lineups, injury news, weather, Bet365 pitcher-outs lines, and prices before any final bet decision.",
         ],
     }
+
+    payload = slim_payload
     if include_details:
-        payload["responseMode"] = "detailed"
-        payload["debugFullGames"] = screened
-        payload["debugFullScreeningGroups"] = screening_groups
-        payload["debugFullRecommendedPitchers"] = recommended_pitchers
-        payload["debugFullNotSelectedPitchers"] = not_selected_pitchers
+        payload = {
+            **slim_payload,
+            "responseMode": "detailed",
+            "outsStage1Dashboard": outs_stage1_dashboard,
+            "games": compact_games,
+            "notSelectedPitchers": compact_not_selected,
+            "outScreeningGroups": compact_groups,
+            "rankGapNotes": rank_gap_notes,
+            "debugFullGames": screened,
+            "debugFullScreeningGroups": screening_groups,
+            "debugFullRecommendedPitchers": recommended_pitchers,
+            "debugFullNotSelectedPitchers": not_selected_pitchers,
+        }
 
     return jsonify(payload)
 
